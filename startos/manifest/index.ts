@@ -3,7 +3,9 @@ import { chain } from '../chain'
 import { long, short } from './i18n'
 
 export const manifest = setupManifest({
-  id: chain.id,
+  // Written out rather than taken from chain.ts, because the SDK makefile reads it from this line
+  // to name the s9pk. The check below keeps the two equal.
+  id: 'frigate-sha256-companion',
   title: chain.title,
   license: 'Apache-2.0',
   packageRepo: chain.packageRepo,
@@ -31,3 +33,6 @@ export const manifest = setupManifest({
   hardwareAcceleration: true,
   // Dependencies are declared in dependencies.ts, which the SDK writes into the manifest.
 })
+
+// A compile-time check that the id above is chain.id: a mismatch is a type error.
+export const idMatchesChain: typeof chain.id = manifest.id

@@ -5,7 +5,7 @@ import { long, short } from './i18n'
 export const manifest = setupManifest({
   // Written out rather than taken from chain.ts, because the SDK makefile reads it from this line
   // to name the s9pk. The check below keeps the two equal.
-  id: 'frigate-sha256-companion',
+  id: 'frigate-blake2b-companion',
   title: chain.title,
   license: 'Apache-2.0',
   packageRepo: chain.packageRepo,

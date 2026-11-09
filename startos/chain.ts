@@ -4,17 +4,17 @@
  * identical, and tools/sync-packages.sh in the frigate-companions project keeps them so.
  */
 export const chain = {
-  id: 'frigate-sha256-companion',
-  title: 'Frigate Electrum Server (SHA256) Companion',
+  id: 'frigate-blake2b-companion',
+  title: 'Frigate Electrum Server (BLAKE2b) Companion',
   /** The chain named in the title and on the icon's band. */
-  band: 'SHA256',
-  packageRepo: 'https://github.com/paulscode/frigate-sha256-companion-startos',
+  band: 'BLAKE2b',
+  packageRepo: 'https://github.com/paulscode/frigate-blake2b-companion-startos',
   /** The node this app is named for. Preferred at install when it is installed. */
-  pairedNode: 'knots-prerdts',
+  pairedNode: 'knots-blake2b',
   /**
    * Preferred external ports, SSL then plaintext. Distinct from the official Frigate's 50002/50001
    * and from the other companion's, so a server running several gets predictable ports.
    */
-  sslPort: 50022,
-  tcpPort: 50021,
+  sslPort: 50032,
+  tcpPort: 50031,
 } as const

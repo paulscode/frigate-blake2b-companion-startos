@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="icon.png" alt="Frigate (SHA256) Companion logo" width="21%">
+  <img src="icon.png" alt="Frigate (BLAKE2b) Companion logo" width="21%">
 </p>
 
-# Frigate Electrum Server (SHA256) Companion on StartOS
+# Frigate Electrum Server (BLAKE2b) Companion on StartOS
 
 > Everything not listed in this document should behave the same as upstream Frigate. If a
 > feature, setting, or behavior is not mentioned here, the upstream documentation is accurate and
@@ -17,14 +17,14 @@ This companion runs **beside** the official Frigate package rather than in its p
 from it in three ways: it works with a **pruned** node and never needs `txindex`; it serves the
 **BLAKE2b** chain as well as the SHA256 one (it follows whichever node is selected); and it uses
 **Electrs Pruned** or **Fulcrum Pruned** as its Electrum backend. It is one of two companions,
-the other being Frigate Electrum Server (BLAKE2b) Companion (`frigate-blake2b-companion`); the two
+the other being Frigate Electrum Server (SHA256) Companion (`frigate-sha256-companion`); the two
 packages are identical except for their id, title, icon and the node they prefer at install, so a
 server can run one per chain.
 
 - **Upstream repo:** <https://github.com/sparrowwallet/frigate>
-- **Wrapper repo:** <https://github.com/paulscode/frigate-sha256-companion-startos>
+- **Wrapper repo:** <https://github.com/paulscode/frigate-blake2b-companion-startos>
 - **Parent wrapper repo:** <https://github.com/Start9-Community/frigate-startos>
-- **StartOS service ID:** `frigate-sha256-companion`
+- **StartOS service ID:** `frigate-blake2b-companion`
 
 ---
 
@@ -119,14 +119,14 @@ differ.
 
 | Interface | Port | Protocol | Purpose |
 |---|---|---|---|
-| Electrum (SSL) (`electrum`) | 50001 internal; preferred external 50022 (SSL), 50021 (plaintext, bridge only) | Electrum over TLS | wallets |
+| Electrum (SSL) (`electrum`) | 50001 internal; preferred external 50032 (SSL), 50031 (plaintext, bridge only) | Electrum over TLS | wallets |
 
-Preferred external ports differ from the official Frigate's (50002/50001) and from the BLAKE2b
-companion's (50032/50031). StartOS assigns the actual ports per server; never quote a literal one.
+Preferred external ports differ from the official Frigate's (50002/50001) and from the SHA256
+companion's (50022/50021). StartOS assigns the actual ports per server; never quote a literal one.
 
 ## Installation and First-Run Flow
 
-1. On install the package chooses the node this app is named for (`knots-prerdts`) if installed,
+1. On install the package chooses the node this app is named for (`knots-blake2b`) if installed,
    else the only supported node installed; and the only supported indexer installed. Otherwise
    it raises a critical **Select Node** and/or **Select Indexer** task, which keeps Frigate
    stopped until answered.
@@ -178,7 +178,7 @@ The volume is backed up except `db/` (the index) and `frigate.log`. A restore re
 ## Quick Reference for AI Consumers
 
 ```yaml
-package_id: frigate-sha256-companion
+package_id: frigate-blake2b-companion
 image: built from Dockerfile (Frigate 1.6.1 + patches/ + paulscode/drongo blake2b) over ghcr.io/remcoros/frigate-docker:1.6.1
 architectures: [x86_64, aarch64]
 volumes:

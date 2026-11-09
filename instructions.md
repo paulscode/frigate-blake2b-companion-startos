@@ -1,4 +1,4 @@
-# Frigate (SHA256) Companion
+# Frigate (BLAKE2b) Companion
 
 ## Documentation
 
@@ -10,7 +10,7 @@
 
 An Electrum server that scans the blockchain for Silent Payments on your wallet's behalf, without learning which payments are yours. Point a Silent Payments wallet at its Electrum address and it can find its incoming payments without downloading the chain itself.
 
-This companion runs beside the official Frigate, works with a **pruned** node, and needs no `txindex`. It follows whichever Bitcoin node you select, on the SHA256 chain or the BLAKE2b chain. It is named for the SHA256 chain, the pairing it is meant for; its twin, Frigate (BLAKE2b) Companion, lets one server run Frigate for each chain.
+This companion runs beside the official Frigate, works with a **pruned** node, and needs no `txindex`. It follows whichever Bitcoin node you select, on the SHA256 chain or the BLAKE2b chain. It is named for the BLAKE2b chain, the pairing it is meant for; its twin, Frigate (SHA256) Companion, lets one server run Frigate for each chain.
 
 Frigate answers Silent Payments queries itself and passes everything else, ordinary address lookups included, to an **indexer**: Electrs Pruned or Fulcrum Pruned (Electrs or Fulcrum also work with an archival node).
 

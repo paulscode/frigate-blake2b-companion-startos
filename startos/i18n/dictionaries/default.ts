@@ -1,48 +1,60 @@
 export const DEFAULT_LANG = 'en_US'
 
 const dict = {
-  // main.ts
-  'Starting Frigate...': 1,
-  'Frigate is running': 2,
-  'Frigate is syncing...': 3,
-  'Sync Progress': 4,
-  'Fully synced': 6,
-
-  // interfaces.ts
-  'Electrum (SSL)': 100,
-  'The Electrum protocol endpoint, served over SSL': 101,
-
-  // actions/config.ts
-  'Configure Frigate': 200,
-  'Set or update Frigate configuration settings.': 201,
-  'Electrum Server': 202,
-  'Where Frigate sends the Electrum requests it does not answer itself, address lookups included. Frigate answers Silent Payments requests on its own.\n- Fulcrum: Fulcrum on this server.\n- Electrs: Electrs on this server.\n- None: no backend; wallets get Silent Payments results only.': 203,
-  'Fulcrum (recommended)': 204,
-  '(not installed)': 205,
-  Electrs: 206,
-  'None (not recommended)': 207,
-  'Advanced settings': 208,
-  'Index Start Height': 211,
-  'Blocks below this height are not indexed, so Silent Payments in them are not found.': 212,
-  'Script PubKey Cache Size': 213,
-  'How many scriptPubKeys Frigate keeps in memory while indexing. A larger cache indexes faster and uses more RAM; 10M uses about 4 GB.': 214,
-  Configuration: 215,
-  'Compute Backend': 216,
-  'Hardware used for historical Silent Payments scans. Mempool and new-block scans always run on the CPU.\n- Auto (prefer GPU): the GPU if one is detected, otherwise the CPU.\n- GPU only: always the GPU.\n- CPU only: never the GPU.': 217,
-  'Auto (prefer GPU)': 218,
-  'GPU only': 219,
-  'CPU only': 220,
-  'Batch Size': 221,
-  'Transactions processed per GPU dispatch. If scanning hangs or becomes unstable on an older GPU, try 10,000 to 50,000.': 222,
-  '10M (default)': 223,
-
-  // dependencies.ts and init/index.ts
-  'Frigate requires txindex, pruning disabled, and ZMQ enabled in Bitcoin.': 300,
-  'Configure Frigate settings': 301,
-} as const
+  'Index Start Height': 0,
+  'Blocks below this height are not indexed, so Silent Payments in them are not found. The default is Taproot activation (709632), the first block where Silent Payments are possible. On a pruned node, a new index starts at the oldest block the node still holds instead, because the node has discarded what it needs for older ones; a larger prune target on the node reaches further back. Changing this rebuilds the index.': 1,
+  'Rebuild Index': 2,
+  "Delete the Silent Payments index and build it again on the next start, from the start height above (or the node's prune height on a pruned node). Use it after the node pruned blocks this index still needed, or to start from a different height. Wallets connected meanwhile see only what has been indexed so far.": 3,
+  'Script PubKey Cache Size': 4,
+  'How many scriptPubKeys Frigate keeps in memory while indexing. A larger cache indexes faster and uses more RAM; 10M uses about 4 GB.': 5,
+  '10M (default)': 6,
+  'Compute Backend': 7,
+  'Hardware used for historical Silent Payments scans. Mempool and new-block scans always run on the CPU.\n- Auto (prefer GPU): the GPU if one is detected, otherwise the CPU.\n- GPU only: always the GPU.\n- CPU only: never the GPU.': 8,
+  'Auto (prefer GPU)': 9,
+  'GPU only': 10,
+  'CPU only': 11,
+  'Batch Size': 12,
+  'Transactions processed per GPU dispatch. If scanning hangs or becomes unstable on an older GPU, try 10,000 to 50,000.': 13,
+  'Configure Frigate': 14,
+  'Index start height, rebuilding the index, and scanning performance.': 15,
+  'Select Indexer': 16,
+  'Choose the Electrum server Frigate passes address lookups to. Frigate answers Silent Payments itself.': 17,
+  "- Electrs Pruned: works with a pruned node.\n- Fulcrum Pruned: works with a pruned node.\n- Electrs: needs an archival (unpruned) node.\n- Fulcrum: needs an archival node with txindex.\nIt must follow the same node as Frigate (see Select Node). On a server with two pruned nodes, run Electrs Pruned on one and Fulcrum Pruned on the other, and pick the one that follows this server's node.": 18,
+  'Select Node': 19,
+  'Choose which installed Bitcoin node Frigate reads blocks and the mempool from.': 20,
+  'The node decides which chain this server serves. Select an indexer that follows the same node: Frigate refuses wallets while the two are on different chains. Switching to a node on another chain needs Rebuild Index under Configure Frigate.': 21,
+  '- Bitcoin Knots: the official Bitcoin service (Knots or Core), or a BLAKE2b build that took its place.\n- Bitcoin Knots (SHA256) Companion: a second, pruned node on the SHA256 chain.\n- Bitcoin Knots (BLAKE2b) Companion: a pruned node on the BLAKE2b chain.\nThe node must be installed on this server.': 22,
+  'Choose which Bitcoin node Frigate follows. It decides which chain your wallets see, so it is not guessed.': 23,
+  'Choose the Electrum server Frigate passes address lookups to. It must follow the same node as Frigate.': 24,
+  'Electrum (SSL)': 25,
+  'The Electrum protocol endpoint, with Silent Payments, served over SSL': 26,
+  'Starting Frigate...': 27,
+  'Choose a node with Select Node and an indexer with Select Indexer.': 28,
+  'Electrum Server': 29,
+  'Frigate is ready': 30,
+  'Waiting for the node': 31,
+  'Frigate opens its Electrum port once its index has caught up with the node.': 32,
+  'Frigate is starting': 33,
+  'Sync Progress': 34,
+  'Fully synced. Silent Payments are indexed from block ${start}.': 35,
+  'Fully synced': 36,
+  'Waiting for the node to finish syncing': 37,
+  'Indexing from block ${start}: ${progress}': 38,
+  'Frigate is syncing...': 39,
+  Indexer: 40,
+  '${indexer} follows the same chain as ${node}': 41,
+  '${indexer} follows a different chain from ${node}, so wallets are refused. Point ${indexer} at ${node} (its Select Node), or select another indexer. ${detail}': 42,
+  'Checking that ${indexer} follows the same chain as ${node}. An indexer opens its Electrum port only once it has caught up with its node.': 43,
+  'The official Bitcoin service, whichever flavor is installed: Knots or Core, on the SHA256 chain, or a BLAKE2b build that took its place.': 44,
+  'A second node on the SHA256 chain, installed alongside your main Bitcoin service, pruned by default.': 45,
+  'A node on the BLAKE2b chain, whose blocks use a different proof of work and a longer header, pruned by default.': 46,
+}
 
 /**
  * Plumbing. DO NOT EDIT.
+ *
+ * Generated by startos/gen-i18n-dict.py from the i18n() calls in this
+ * package. Add a string by using it, then re-run that script.
  */
 export type I18nKey = keyof typeof dict
 export type LangDict = Record<(typeof dict)[I18nKey], string>

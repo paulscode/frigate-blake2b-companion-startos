@@ -1,0 +1,242 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Craig Raw <craigraw@gmail.com>
+Date: Mon, 19 Oct 2026 09:13:42 -0700
+Subject: [PATCH 2/4] send notifications without an id and document silent
+ payments notification params as positional
+
+(cherry picked from commit 92518bb4811a52ef65cdcef29a741d59aed7d56b)
+---
+ README.md                                     | 55 ++++++++++---------
+ .../electrum/ElectrumNotificationService.java | 41 ++++++++------
+ .../ElectrumNotificationTransport.java        | 19 -------
+ .../frigate/electrum/RequestHandler.java      |  6 +-
+ .../ElectrumNotificationServiceTest.java      | 15 +++--
+ 5 files changed, 68 insertions(+), 68 deletions(-)
+ delete mode 100644 src/main/java/com/sparrowwallet/frigate/electrum/ElectrumNotificationTransport.java
+
+diff --git a/README.md b/README.md
+index 8ae2b3b..92679ec 100644
+--- a/README.md
++++ b/README.md
+@@ -680,47 +680,50 @@ blockchain.silentpayments.subscribe(subscription, progress, history)
+ 
+ **Body**
+ 
+-A dictionary with the following key/value pairs:
++As with other Electrum notifications, `params` is a positional array `[subscription, progress, history]`:
+ 
+-1. A `subscription` JSON object literal containing details of the current subscription:
++1. `subscription`: A JSON object literal containing details of the current subscription:
+ - _address_: The silent payment address that has been subscribed to.
+ - _labels_: An array of the labels that are subscribed to (must include `0`).
+ - _start_height_: The block height from which the subscription scan was started.
+ 
+-2. A `progress` key/value pair indicating the progress of a historical scan:
+-- _progress_: A floating point value between `0.0` and `1.0`. Will be `1.0` for all current (up to date) results.
++2. `progress`: A floating point value between `0.0` and `1.0` indicating the progress of a historical scan. Will be `1.0` for all current (up to date) results.
+ 
+-3. A `history` array of transactions. Confirmed transactions are listed in order by height, followed by mempool transactions in arbitary order. Each transaction is a dictionary with the following keys:
++3. `history`: An array of transactions. Confirmed transactions are listed in order by height, followed by mempool transactions in arbitrary order. Each transaction is a dictionary with the following keys:
+ - _height_: The integer height of the block the transaction was confirmed in. For mempool transactions, `0` should be used.
+ - _tx_hash_: The transaction hash in hexadecimal.
+ - _tweak_key_: The tweak key (`input_hash*A`) for the transaction in compressed format.
+ 
+-**Result Example**
++**Notification Example**
+ 
+ ```json
+ {
+-  "subscription": {
+-    "address": "sp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqjuexzk6murw56suy3e0rd2cgqvycxttddwsvgxe2usfpxumr70xc9pkqwv",
+-    "labels": [0],
+-    "start_height": 882000
+-  },
+-  "progress": 1.0,
+-  "history": [
+-    {
+-      "height": 890004,
+-      "tx_hash": "acc3758bd2a26f869fcc67d48ff30b96464d476bca82c1cd6656e7d506816412",
+-      "tweak_key": "0314bec14463d6c0181083d607fecfba67bb83f95915f6f247975ec566d5642ee8"
+-    },
++  "jsonrpc": "2.0",
++  "method": "blockchain.silentpayments.subscribe",
++  "params": [
+     {
+-      "height": 905008,
+-      "tx_hash": "f3e1bf48975b8d6060a9de8884296abb80be618dc00ae3cb2f6cee3085e09403",
+-      "tweak_key": "024ac253c216532e961988e2a8ce266a447c894c781e52ef6cee902361db960004"
++      "address": "sp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqjuexzk6murw56suy3e0rd2cgqvycxttddwsvgxe2usfpxumr70xc9pkqwv",
++      "labels": [0],
++      "start_height": 882000
+     },
+-    {
+-      "height": 0,
+-      "tx_hash": "f4184fc596403b9d638783cf57adfe4c75c605f6356fbc91338530e9831e9e16",
+-      "tweak_key": "03aeea547819c08413974e2ab2b12212e007166bb2058f88b009e082b9b4914a58"
+-    }
++    1.0,
++    [
++      {
++        "height": 890004,
++        "tx_hash": "acc3758bd2a26f869fcc67d48ff30b96464d476bca82c1cd6656e7d506816412",
++        "tweak_key": "0314bec14463d6c0181083d607fecfba67bb83f95915f6f247975ec566d5642ee8"
++      },
++      {
++        "height": 905008,
++        "tx_hash": "f3e1bf48975b8d6060a9de8884296abb80be618dc00ae3cb2f6cee3085e09403",
++        "tweak_key": "024ac253c216532e961988e2a8ce266a447c894c781e52ef6cee902361db960004"
++      },
++      {
++        "height": 0,
++        "tx_hash": "f4184fc596403b9d638783cf57adfe4c75c605f6356fbc91338530e9831e9e16",
++        "tweak_key": "03aeea547819c08413974e2ab2b12212e007166bb2058f88b009e082b9b4914a58"
++      }
++    ]
+   ]
+ }
+ ```
+diff --git a/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumNotificationService.java b/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumNotificationService.java
+index dee7b14..a3af9d5 100644
+--- a/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumNotificationService.java
++++ b/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumNotificationService.java
+@@ -1,27 +1,34 @@
+ package com.sparrowwallet.frigate.electrum;
+ 
+-import com.github.arteam.simplejsonrpc.client.JsonRpcParams;
+-import com.github.arteam.simplejsonrpc.client.ParamsType;
+-import com.github.arteam.simplejsonrpc.core.annotation.JsonRpcMethod;
+-import com.github.arteam.simplejsonrpc.core.annotation.JsonRpcOptional;
+-import com.github.arteam.simplejsonrpc.core.annotation.JsonRpcParam;
+-import com.github.arteam.simplejsonrpc.core.annotation.JsonRpcService;
++import com.github.arteam.simplejsonrpc.client.JsonRpcClient;
++import com.github.arteam.simplejsonrpc.client.Transport;
+ 
+ import java.util.List;
+ 
+ /**
+- * Notifications sent to clients. Their params are positional, as the Electrum protocol specifies and Electrum servers send them,
+- * rather than named, the JSON-RPC client library's default; a null status is sent explicitly as null.
++ * Notifications sent to clients. They carry no id, as JSON-RPC notifications do, and their params are positional, as the Electrum protocol specifies
++ * and Electrum servers send them; a null status is sent explicitly as null.
+  */
+-@JsonRpcService
+-@JsonRpcParams(ParamsType.ARRAY)
+-public interface ElectrumNotificationService {
+-    @JsonRpcMethod("blockchain.headers.subscribe")
+-    void notifyHeaders(@JsonRpcParam("header") ElectrumBlockHeader electrumBlockHeader);
++public class ElectrumNotificationService {
++    private final JsonRpcClient jsonRpcClient;
+ 
+-    @JsonRpcMethod("blockchain.scripthash.subscribe")
+-    void notifyScriptHash(@JsonRpcParam("scripthash") String scriptHash, @JsonRpcOptional @JsonRpcParam("status") String status);
++    public ElectrumNotificationService(Transport transport) {
++        this.jsonRpcClient = new JsonRpcClient(transport);
++    }
+ 
+-    @JsonRpcMethod("blockchain.silentpayments.subscribe")
+-    void notifySilentPayments(@JsonRpcParam("subscription") SilentPaymentsSubscription silentPaymentsSubscription, @JsonRpcParam("progress") double progress, @JsonRpcParam("history") List<SilentPaymentsTxEntry> history);
++    public void notifyHeaders(ElectrumBlockHeader electrumBlockHeader) {
++        notify("blockchain.headers.subscribe", electrumBlockHeader);
++    }
++
++    public void notifyScriptHash(String scriptHash, String status) {
++        notify("blockchain.scripthash.subscribe", scriptHash, status);
++    }
++
++    public void notifySilentPayments(SilentPaymentsSubscription silentPaymentsSubscription, double progress, List<SilentPaymentsTxEntry> history) {
++        notify("blockchain.silentpayments.subscribe", silentPaymentsSubscription, progress, history);
++    }
++
++    private void notify(String method, Object... params) {
++        jsonRpcClient.createNotification().method(method).params(params).execute();
++    }
+ }
+diff --git a/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumNotificationTransport.java b/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumNotificationTransport.java
+deleted file mode 100644
+index 9018ac6..0000000
+--- a/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumNotificationTransport.java
++++ /dev/null
+@@ -1,19 +0,0 @@
+-package com.sparrowwallet.frigate.electrum;
+-
+-import com.github.arteam.simplejsonrpc.client.Transport;
+-
+-import java.io.IOException;
+-
+-public class ElectrumNotificationTransport implements Transport {
+-    private final RequestHandler requestHandler;
+-
+-    public ElectrumNotificationTransport(RequestHandler requestHandler) {
+-        this.requestHandler = requestHandler;
+-    }
+-
+-    @Override
+-    public String pass(String request) throws IOException {
+-        requestHandler.writeLine(request);
+-        return "{\"result\":{},\"error\":null,\"id\":1}";
+-    }
+-}
+diff --git a/src/main/java/com/sparrowwallet/frigate/electrum/RequestHandler.java b/src/main/java/com/sparrowwallet/frigate/electrum/RequestHandler.java
+index 62b1e2f..bb3e514 100644
+--- a/src/main/java/com/sparrowwallet/frigate/electrum/RequestHandler.java
++++ b/src/main/java/com/sparrowwallet/frigate/electrum/RequestHandler.java
+@@ -1,6 +1,5 @@
+ package com.sparrowwallet.frigate.electrum;
+ 
+-import com.github.arteam.simplejsonrpc.client.JsonRpcClient;
+ import com.github.arteam.simplejsonrpc.server.JsonRpcServer;
+ import com.google.common.eventbus.Subscribe;
+ import com.sparrowwallet.drongo.protocol.Sha256Hash;
+@@ -98,7 +97,10 @@ public class RequestHandler implements Runnable, SubscriptionStatus, HeadersDisp
+                     new BackendSubscriptionService(scriptHashSubscriptions, this::notifyScriptHash), requestTimeoutMillis, backendTls);
+         }
+         this.electrumServerService = new ElectrumServerService(bitcoindClient, this, indexQuerier, backendTransport);
+-        this.notificationService = new JsonRpcClient(new ElectrumNotificationTransport(this)).onDemand(ElectrumNotificationService.class);
++        this.notificationService = new ElectrumNotificationService(request -> {
++            writeLine(request);
++            return null;
++        });
+         this.notifier = new AsyncNotifier("ElectrumNotify-" + System.identityHashCode(this), Config.get().getLimits().getNotificationQueueSize(), scriptHashSubscriptions,
+                 notificationService::notifyScriptHash, this::disconnectSlowConsumer);
+         if(backendTransport != null) {
+diff --git a/src/test/java/com/sparrowwallet/frigate/electrum/ElectrumNotificationServiceTest.java b/src/test/java/com/sparrowwallet/frigate/electrum/ElectrumNotificationServiceTest.java
+index b27366c..f7b05bc 100644
+--- a/src/test/java/com/sparrowwallet/frigate/electrum/ElectrumNotificationServiceTest.java
++++ b/src/test/java/com/sparrowwallet/frigate/electrum/ElectrumNotificationServiceTest.java
+@@ -2,7 +2,6 @@ package com.sparrowwallet.frigate.electrum;
+ 
+ import com.fasterxml.jackson.databind.JsonNode;
+ import com.fasterxml.jackson.databind.ObjectMapper;
+-import com.github.arteam.simplejsonrpc.client.JsonRpcClient;
+ import com.github.arteam.simplejsonrpc.server.JsonRpcServer;
+ import com.google.common.eventbus.Subscribe;
+ import com.sparrowwallet.frigate.cli.FrigateCli;
+@@ -19,10 +18,10 @@ public class ElectrumNotificationServiceTest {
+     private static final String SCRIPT_HASH = "a0".repeat(32);
+ 
+     private final List<String> sent = new ArrayList<>();
+-    private final ElectrumNotificationService service = new JsonRpcClient(request -> {
++    private final ElectrumNotificationService service = new ElectrumNotificationService(request -> {
+         sent.add(request);
+-        return "{\"result\":{},\"error\":null,\"id\":1}";
+-    }).onDemand(ElectrumNotificationService.class);
++        return null;
++    });
+ 
+     private JsonNode params() throws Exception {
+         return MAPPER.readTree(sent.getLast()).path("params");
+@@ -34,6 +33,14 @@ public class ElectrumNotificationServiceTest {
+         assertEquals(MAPPER.readTree("[\"" + SCRIPT_HASH + "\",\"" + "01".repeat(32) + "\"]"), params());
+     }
+ 
++    @Test
++    public void notificationsCarryNoId() throws Exception {
++        service.notifyHeaders(new ElectrumBlockHeader(915000, "00ff"));
++        JsonNode notification = MAPPER.readTree(sent.getLast());
++        assertEquals("blockchain.headers.subscribe", notification.path("method").asText());
++        assertFalse(notification.has("id"));
++    }
++
+     @Test
+     public void nullStatusIsSentExplicitly() throws Exception {
+         service.notifyScriptHash(SCRIPT_HASH, null);

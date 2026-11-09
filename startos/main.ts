@@ -1,172 +1,221 @@
 import { manifest as bitcoinManifest } from 'bitcoin-core-startos/startos/manifest'
-import {
-  rpcHostId,
-  rpcPort,
-  zmqHostId,
-  zmqPortTransaction,
-} from 'bitcoin-core-startos/startos/utils'
-import {
-  electrumHostId as electrsHostId,
-  port as electrsPort,
-} from 'electrs-startos/startos/utils'
-import {
-  electrumPort as fulcrumPort,
-  mainHostId as fulcrumHostId,
-} from 'fulcrum-startos/startos/utils'
+import { readFile, rm } from 'fs/promises'
+import { StringDecoder } from 'string_decoder'
 import {
   config,
   excludedSubnetsForStartosProxy,
 } from './fileModels/config.toml'
-import { store } from './fileModels/store.json'
-import { sdk } from './sdk'
+import { storeJson } from './fileModels/store.json'
 import { i18n } from './i18n'
-import { electrumPort } from './utils'
+import { indexers } from './indexers'
+import { nodes } from './nodes'
+import { sdk } from './sdk'
+import {
+  dbDirOnVolume,
+  electrumPort,
+  frigateHome,
+  startHeightFile,
+} from './utils'
 
 export const main = sdk.setupMain(async ({ effects }) => {
   console.info(i18n('Starting Frigate...'))
 
-  // Watch only user-controlled settings. Address rewrites below do not restart
-  // main unless the selected provider or its assigned bridge port changes.
+  // Restart on the user's settings only. The address rewrites below restart main only when the
+  // selected node's or indexer's bridge address changes.
   await config.read(({ index, scan }) => ({ index, scan })).const(effects)
+  const nodeId = await storeJson.read((s) => s.node).const(effects)
+  const indexerId = await storeJson.read((s) => s.indexer).const(effects)
+  if (!nodeId || !indexerId) {
+    throw new Error(
+      i18n(
+        'Choose a node with Select Node and an indexer with Select Indexer.',
+      ),
+    )
+  }
+  const node = nodes[nodeId]
+  const indexer = indexers[indexerId]
 
-  const selection =
-    (await store.read((value) => value.electrumServer).const(effects)) ?? 'none'
-  const startosProxyIp = await sdk.getOsIp(effects)
-  const rpcAddress = await sdk.host
+  // Rebuild Index (Configure Frigate): the index and its start-height record go; Frigate builds a
+  // new one from the start height, or from the node's prune height on a pruned node.
+  if (await storeJson.read((s) => s.rebuildIndex).const(effects)) {
+    console.warn('Rebuild Index requested: deleting the Silent Payments index')
+    await rm(dbDirOnVolume, { recursive: true, force: true })
+    await storeJson.merge(effects, { rebuildIndex: false })
+  }
+
+  // The node's RPC over the LXC bridge: its btc-rpc-proxy when it prunes. Null while the node is
+  // absent, in which case its volume is not mounted (a missing dependency's mount would fail the
+  // start), Frigate waits for a cookie, and the .const() heals it with one restart.
+  const rpc = await sdk.host
     .getBridgeAddress(effects, {
-      packageId: 'bitcoind',
-      hostId: rpcHostId,
-      internalPort: rpcPort,
+      packageId: nodeId,
+      hostId: node.rpc.hostId,
+      internalPort: node.rpc.port,
       ssl: false,
     })
     .const()
-  const zmqAddress = await sdk.host
+  const zmq = await sdk.host
     .getBridgeAddress(effects, {
-      packageId: 'bitcoind',
-      hostId: zmqHostId,
-      internalPort: zmqPortTransaction,
+      packageId: nodeId,
+      hostId: node.zmq.hostId,
+      internalPort: node.zmq.port,
     })
     .const()
-  const backendAddress =
-    selection === 'fulcrum'
-      ? await sdk.host
-          .getBridgeAddress(effects, {
-            packageId: 'fulcrum',
-            hostId: fulcrumHostId,
-            internalPort: fulcrumPort,
-          })
-          .const()
-      : selection === 'electrs'
-        ? await sdk.host
-            .getBridgeAddress(effects, {
-              packageId: 'electrs',
-              hostId: electrsHostId,
-              internalPort: electrsPort,
-            })
-            .const()
-        : null
+    .catch(() => null)
+  const backend = await sdk.host
+    .getBridgeAddress(effects, {
+      packageId: indexerId,
+      hostId: indexer.hostId,
+      internalPort: indexer.port,
+      ssl: false,
+    })
+    .const()
 
   await config.merge(
     effects,
     {
       core: {
         connect: true,
-        server: rpcAddress ? `http://${rpcAddress}` : undefined,
+        server: rpc ? `http://${rpc}` : undefined,
         authType: 'COOKIE',
         auth: '',
         dataDir: '/root/.bitcoin',
-        zmqSequenceEndpoint: zmqAddress ? `tcp://${zmqAddress}` : undefined,
+        // Every node here publishes `sequence` beside rawtx when its ZeroMQ is on. When it is off
+        // nothing listens there, Frigate never hears from it, and it polls every 5 seconds instead.
+        zmqSequenceEndpoint: zmq ? `tcp://${zmq}` : undefined,
       },
-      server: {
-        backendElectrumServer: backendAddress ? `tcp://${backendAddress}` : '',
-      },
-      // Frigate 1.6 applies per-IP limits to incoming clients. StartOS
-      // terminates TLS and makes this connection from its lxcbr0 gateway, so
-      // preserve upstream's loopback exceptions and exempt that proxy too.
+      server: { backendElectrumServer: backend ? `tcp://${backend}` : '' },
       limits: {
-        excludedSubnets: excludedSubnetsForStartosProxy(startosProxyIp),
+        excludedSubnets: excludedSubnetsForStartosProxy(
+          await sdk.getOsIp(effects),
+        ),
       },
     },
     { allowWriteAfterConst: true },
   )
 
-  const subcontainer = await sdk.SubContainer.eager(
+  const volume = sdk.Mounts.of().mountVolume({
+    volumeId: 'main',
+    subpath: null,
+    mountpoint: frigateHome,
+    readonly: false,
+  })
+  const subcontainer = await sdk.SubContainer.of(
     effects,
-    {
-      imageId: 'main',
-    },
-    sdk.Mounts.of()
-      .mountVolume({
-        volumeId: 'main',
-        subpath: null,
-        mountpoint: '/root/.frigate',
-        readonly: false,
-      })
-      .mountDependency<typeof bitcoinManifest>({
-        dependencyId: 'bitcoind',
-        mountpoint: '/root/.bitcoin',
-        volumeId: 'main',
-        subpath: null,
-        readonly: true,
-      }),
+    { imageId: 'main' },
+    rpc
+      ? volume.mountDependency<typeof bitcoinManifest>({
+          // Any of the three; they share the volume id `main`, with the mainnet cookie at its root.
+          dependencyId: nodeId as 'bitcoind',
+          volumeId: 'main',
+          subpath: null,
+          mountpoint: '/root/.bitcoin',
+          readonly: true,
+        })
+      : volume,
     'main',
   )
 
-  // Frigate announces the index it is about to build a few seconds after
-  // launch, then reports progress only every 30s. Readiness keys off the
-  // announcement: keying off progress alone leaves a healthy service reporting
-  // failure for the first half-minute of every start.
+  // What Frigate's log says, for the health checks. Frigate announces the index it is about to
+  // build a few seconds after launch, then reports progress every 30s.
   let indexing = false
-  let lastSyncLog: string | null = null
+  let waitingForNodeSync = false
+  let lastProgress: string | null = null
+  let fatal: string | null = null
+  let backendCheck: 'unknown' | 'same' | 'different' = 'unknown'
+  let backendDetail: string | null = null
+
+  const onLine = (line: string) => {
+    if (/Indexing \d+ blocks|Block index is up to date/.test(line))
+      indexing = true
+    if (line.includes('Waiting for sync to complete')) waitingForNodeSync = true
+    if (/Indexing \d+ blocks/.test(line)) waitingForNodeSync = false
+    const progress = /Indexing progress: (.+)/.exec(line)
+    if (progress) {
+      indexing = true
+      lastProgress = progress[1].trim()
+    }
+    const f = /FATAL: (.+)/.exec(line)
+    if (f) fatal = f[1].trim().slice(0, 400)
+    if (line.includes('Backend chain check: the Electrum backend follows')) {
+      backendCheck = 'same'
+      backendDetail = null
+    }
+    const failed = /Backend chain check FAILED: (.+)/.exec(line)
+    if (failed) {
+      backendCheck = 'different'
+      backendDetail = failed[1].trim().slice(0, 300)
+    }
+  }
+  const lineReader = () => {
+    let pending = ''
+    const decoder = new StringDecoder('utf8')
+    return (chunk: unknown, log: (s: string) => void) => {
+      const text = Buffer.isBuffer(chunk) ? decoder.write(chunk) : String(chunk)
+      log(text)
+      pending += text
+      const lines = pending.split('\n')
+      pending = lines.pop() ?? ''
+      lines.forEach(onLine)
+    }
+  }
+  const stdout = lineReader()
+  const stderr = lineReader()
+
+  const listening = () =>
+    sdk.healthCheck.checkPortListening(effects, electrumPort, {
+      successMessage: '',
+      errorMessage: '',
+    })
+  const indexStart = async () =>
+    (await readFile(startHeightFile, 'utf8').catch(() => '')).trim()
 
   return sdk.Daemons.of(effects)
     .addDaemon('primary', {
       subcontainer,
       exec: {
-        command: sdk.useEntrypoint(),
-        env: {
-          NETWORK: 'mainnet',
-        },
-        onStdout: (chunk) => {
-          const text = Buffer.isBuffer(chunk)
-            ? chunk.toString('utf8')
-            : String(chunk)
-
-          console.log(text)
-
-          if (/Indexing \d+ blocks|Block index is up to date/.test(text)) {
-            indexing = true
-          }
-
-          const match = text.match(/Indexing progress: (.+)/)
-          if (match) {
-            indexing = true
-            lastSyncLog = match[1].trim()
+        fn: async () => {
+          indexing = false
+          lastProgress = null
+          fatal = null
+          return {
+            command: [
+              'sh',
+              '-c',
+              // Frigate stops at once without the node's cookie, so wait for it (the node starting,
+              // or not yet installed), then run the image's own entrypoint.
+              `for i in $(seq 1 300); do
+  [ -r /root/.bitcoin/.cookie ] && break
+  [ "$i" = 1 ] && echo "Waiting for the node's RPC cookie"
+  sleep 1
+done
+exec /usr/local/bin/docker-entrypoint.sh`,
+            ],
+            env: { NETWORK: 'mainnet' },
+            onStdout: (chunk) => stdout(chunk, console.log),
+            onStderr: (chunk) => stderr(chunk, console.error),
           }
         },
       },
       ready: {
         display: i18n('Electrum Server'),
         fn: async () => {
-          const result = await sdk.healthCheck.checkPortListening(
-            effects,
-            electrumPort,
-            {
-              successMessage: i18n('Frigate is running'),
-              errorMessage: i18n('Frigate is syncing...'),
-            },
-          )
-
-          if (result.result === 'success') return result
-
-          if (indexing) {
+          if ((await listening()).result === 'success') {
+            return { result: 'success', message: i18n('Frigate is ready') }
+          }
+          if (fatal) return { result: 'failure', message: fatal }
+          if (!rpc) {
+            return { result: 'starting', message: i18n('Waiting for the node') }
+          }
+          if (indexing || waitingForNodeSync) {
             return {
               result: 'loading',
-              message: i18n('Frigate is syncing...'),
+              message: i18n(
+                'Frigate opens its Electrum port once its index has caught up with the node.',
+              ),
             }
           }
-
-          return result
+          return { result: 'starting', message: i18n('Frigate is starting') }
         },
       },
       requires: [],
@@ -175,27 +224,73 @@ export const main = sdk.setupMain(async ({ effects }) => {
       ready: {
         display: i18n('Sync Progress'),
         fn: async () => {
-          // If the port is open, Frigate is fully synced.
-          const portCheck = await sdk.healthCheck.checkPortListening(
-            effects,
-            electrumPort,
-            {
-              successMessage: i18n('Fully synced'),
-              errorMessage: '',
-            },
-          )
-          if (portCheck.result === 'success') return portCheck
-
-          if (!lastSyncLog) {
+          const start = await indexStart()
+          if ((await listening()).result === 'success') {
             return {
-              message: i18n('Frigate is syncing...'),
-              result: 'loading',
+              result: 'success',
+              message: start
+                ? i18n(
+                    'Fully synced. Silent Payments are indexed from block ${start}.',
+                    { start },
+                  )
+                : i18n('Fully synced'),
             }
           }
-
+          if (fatal) return { result: 'failure', message: fatal }
+          if (waitingForNodeSync) {
+            return {
+              result: 'loading',
+              message: i18n('Waiting for the node to finish syncing'),
+            }
+          }
+          if (lastProgress) {
+            return {
+              result: 'loading',
+              message: start
+                ? i18n('Indexing from block ${start}: ${progress}', {
+                    start,
+                    progress: lastProgress,
+                  })
+                : lastProgress,
+            }
+          }
+          return { result: 'loading', message: i18n('Frigate is syncing...') }
+        },
+      },
+      requires: [],
+    })
+    .addHealthCheck('indexer', {
+      ready: {
+        display: i18n('Indexer'),
+        fn: async () => {
+          if (backendCheck === 'same') {
+            return {
+              result: 'success',
+              message: i18n('${indexer} follows the same chain as ${node}', {
+                indexer: indexer.title,
+                node: node.title,
+              }),
+            }
+          }
+          if (backendCheck === 'different') {
+            return {
+              result: 'failure',
+              message: i18n(
+                '${indexer} follows a different chain from ${node}, so wallets are refused. Point ${indexer} at ${node} (its Select Node), or select another indexer. ${detail}',
+                {
+                  indexer: indexer.title,
+                  node: node.title,
+                  detail: backendDetail ?? '',
+                },
+              ),
+            }
+          }
           return {
-            message: lastSyncLog,
             result: 'loading',
+            message: i18n(
+              'Checking that ${indexer} follows the same chain as ${node}. An indexer opens its Electrum port only once it has caught up with its node.',
+              { indexer: indexer.title, node: node.title },
+            ),
           }
         },
       },

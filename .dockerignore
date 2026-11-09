@@ -1,2 +1,3 @@
-.git
-.gitmodules
+# Only the Dockerfile's inputs go into the image build.
+*
+!patches

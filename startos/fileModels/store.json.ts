@@ -1,28 +1,27 @@
-import { FileHelper, T, z } from '@start9labs/start-sdk'
+import { FileHelper, z } from '@start9labs/start-sdk'
+import { indexerIds, IndexerId } from '../indexers'
+import { nodeIds, NodeId } from '../nodes'
 import { sdk } from '../sdk'
-import {
-  config,
-  ElectrumServerType,
-  legacyElectrumServerByUrl,
-} from './config.toml'
 
-const shape = z.looseObject({
-  electrumServer: z
-    .union([z.literal('fulcrum'), z.literal('electrs'), z.literal('none')])
-    .catch('none'),
+/**
+ * StartOS-side state, beside Frigate's own config.toml:
+ *   - node, indexer: the Select Node and Select Indexer choices (null until made);
+ *   - rebuildIndex: set by Configure Frigate; main deletes the index before the next start, then
+ *     clears it.
+ */
+const shape = z.object({
+  node: z
+    .enum(nodeIds as [NodeId, ...NodeId[]])
+    .nullable()
+    .catch(null),
+  indexer: z
+    .enum(indexerIds as [IndexerId, ...IndexerId[]])
+    .nullable()
+    .catch(null),
+  rebuildIndex: z.boolean().catch(false),
 })
 
-export const store = FileHelper.json(
+export const storeJson = FileHelper.json(
   { base: sdk.volumes.main, subpath: '/store.json' },
   shape,
 )
-
-export async function ensureStore(effects: T.Effects) {
-  if (await store.read().once()) return
-  const existingConfig = await config.read().once()
-  const electrumServer: ElectrumServerType = existingConfig
-    ? (legacyElectrumServerByUrl[existingConfig.server.backendElectrumServer] ??
-      'none')
-    : 'none'
-  await store.write(effects, { electrumServer })
-}

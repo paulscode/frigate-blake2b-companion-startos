@@ -1,0 +1,763 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Paul Lamb <paul@paulscode.com>
+Date: Sun, 8 Nov 2026 23:26:55 -0600
+Subject: [PATCH 4/4] Electrum protocol 1.8 on a chain with v2 headers, and a
+ backend chain check
+
+On a chain whose tip is a v2 header (164 bytes, BLAKE2b proof of work),
+Frigate now follows the rule Electrs Pruned uses (its patch 0006) and
+docs/electrum-header-v2.md in the electrs-pruned repository:
+
+- it negotiates protocol 1.8 only with wallets, and refuses a lower
+  version with a reason. A client below 1.8 would read 80 bytes of a
+  164-byte header and fail to link the chain without saying why;
+- the rule is also checked where Frigate serves headers itself
+  (headers.subscribe, block.header, block.headers), and a subscribed
+  client that negotiated lower is disconnected when the tip turns v2,
+  rather than sent a header it would misread;
+- the backend is asked for a range reaching 1.8 whatever the wallet's
+  own maximum, since Electrs Pruned refuses anything lower on this chain.
+  A backend answering lower (privkeyio's Fulcrum stops at 1.6) still
+  serves the chain's headers, in one of the two reply forms a 1.8 client
+  must read, so the wallet is told 1.8 either way;
+- server.features reports 1.8 as Frigate's own range and carries
+  blake2b_fork, passed through from the backend (the record used to drop
+  unknown fields) or found on the node by binary search when the backend
+  does not report it. The Sparrow BLAKE2b fork cross-checks it.
+
+On every other chain negotiation is unchanged.
+
+The backend chain check compares one recent header byte for byte, the
+backend's blockchain.block.header against the node's raw header at the
+same height, at startup and every ten minutes on a connection of its
+own. Two chains sharing history differ in every header above their split.
+A backend on another chain refuses wallets at server.version with a
+reason, and the log says FAILED; one that could not be checked is not
+held against them.
+---
+ .../com/sparrowwallet/frigate/Frigate.java    |   3 +
+ .../frigate/bitcoind/BitcoindClient.java      |  48 ++++++
+ .../frigate/electrum/BackendChainCheck.java   | 135 +++++++++++++++++
+ .../BackendChainMismatchException.java        |  14 ++
+ .../electrum/ElectrumBackendService.java      |   3 +
+ .../electrum/ElectrumServerService.java       | 103 ++++++++++++-
+ .../HeaderVersionRefusedException.java        |  25 ++++
+ .../frigate/electrum/RequestHandler.java      |  10 ++
+ .../frigate/electrum/ServerFeatures.java      |  31 +++-
+ .../com/sparrowwallet/frigate/io/Config.java  |   3 +-
+ .../frigate/electrum/ProtocolV2Test.java      | 139 ++++++++++++++++++
+ 11 files changed, 503 insertions(+), 11 deletions(-)
+ create mode 100644 src/main/java/com/sparrowwallet/frigate/electrum/BackendChainCheck.java
+ create mode 100644 src/main/java/com/sparrowwallet/frigate/electrum/BackendChainMismatchException.java
+ create mode 100644 src/main/java/com/sparrowwallet/frigate/electrum/HeaderVersionRefusedException.java
+ create mode 100644 src/test/java/com/sparrowwallet/frigate/electrum/ProtocolV2Test.java
+
+diff --git a/src/main/java/com/sparrowwallet/frigate/Frigate.java b/src/main/java/com/sparrowwallet/frigate/Frigate.java
+index 5c69da1..7020b72 100644
+--- a/src/main/java/com/sparrowwallet/frigate/Frigate.java
++++ b/src/main/java/com/sparrowwallet/frigate/Frigate.java
+@@ -82,6 +82,9 @@ public class Frigate {
+         }
+         InetSocketAddress tcpBind = toBindAddress(serverConfig.getTcpServer());
+         InetSocketAddress sslBind = toBindAddress(serverConfig.getSslServer());
++        if(bitcoindClient != null) {
++            com.sparrowwallet.frigate.electrum.BackendChainCheck.start(bitcoindClient, serverConfig.getBackendElectrumServerObj());
++        }
+         indexQuerier = new IndexQuerier(blocksIndex, mempoolIndex);
+         electrumServer = new ElectrumServerRunnable(bitcoindClient, indexQuerier, tcpBind, sslBind, sslContext);
+         Thread electrumServerThread = new Thread(electrumServer, "Frigate Electrum Server");
+diff --git a/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java b/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java
+index 31726c4..d9ea085 100644
+--- a/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java
++++ b/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java
+@@ -11,6 +11,7 @@ import com.sparrowwallet.drongo.wallet.BlockTransaction;
+ import com.sparrowwallet.frigate.Frigate;
+ import com.sparrowwallet.frigate.electrum.ElectrumBlockHeader;
+ import com.sparrowwallet.frigate.electrum.HeadersDispatcher;
++import com.sparrowwallet.frigate.electrum.ServerFeatures;
+ import com.sparrowwallet.frigate.index.Index;
+ import com.sparrowwallet.frigate.io.Config;
+ import com.sparrowwallet.frigate.io.CoreAuthType;
+@@ -309,6 +310,53 @@ public class BitcoindClient {
+         return false;
+     }
+ 
++    private volatile ServerFeatures.Blake2bFork forkPoint;
++    private volatile String forkPointTip;
++
++    /**
++     * The first v2 header on the node's chain, in the shape Electrs Pruned and Fulcrum Pruned report in server.features, for a backend
++     * that does not report it. Found by binary search over the node's headers rather than compiled in, so a regtest activation height
++     * is right too; cached against the tip, and kept while the header at its height is unchanged (a header commits to every header
++     * below it, so a reorg at or below the fork point changes it).
++     *
++     * @return the fork point, or null if the chain has no v2 header
++     */
++    public ServerFeatures.Blake2bFork getBlake2bForkPoint() {
++        ElectrumBlockHeader current = tip;
++        if(current == null || !current.isV2()) {
++            return null;
++        }
++        ServerFeatures.Blake2bFork cached = forkPoint;
++        if(cached != null && current.hex().equals(forkPointTip)) {
++            return cached;
++        }
++        try {
++            BitcoindClientService service = getBitcoindService();
++            if(cached != null && cached.height() <= current.height() && cached.hash().equals(service.getBlockHash(cached.height()))) {
++                forkPointTip = current.hex();
++                return cached;
++            }
++            int low = 0, high = current.height();
++            while(low < high) {
++                int mid = low + (high - low) / 2;
++                if(ElectrumBlockHeader.isV2(service.getBlockHeader(service.getBlockHash(mid), false))) {
++                    high = mid;
++                } else {
++                    low = mid + 1;
++                }
++            }
++            //the search assumes every header from the first v2 one on is v2, which is how the chain activates; report only a real switch
++            boolean predecessorLegacy = low == 0 || !ElectrumBlockHeader.isV2(service.getBlockHeader(service.getBlockHash(low - 1), false));
++            ServerFeatures.Blake2bFork found = predecessorLegacy ? ServerFeatures.Blake2bFork.of(low, service.getBlockHash(low)) : null;
++            forkPoint = found;
++            forkPointTip = current.hex();
++            return found;
++        } catch(RuntimeException e) {
++            log.warn("Could not find the BLAKE2b fork point", e);
++            return null;
++        }
++    }
++
+     private synchronized void updateBlocksIndex() {
+         HexFormat hexFormat = HexFormat.of();
+ 
+diff --git a/src/main/java/com/sparrowwallet/frigate/electrum/BackendChainCheck.java b/src/main/java/com/sparrowwallet/frigate/electrum/BackendChainCheck.java
+new file mode 100644
+index 0000000..5aee7b0
+--- /dev/null
++++ b/src/main/java/com/sparrowwallet/frigate/electrum/BackendChainCheck.java
+@@ -0,0 +1,135 @@
++package com.sparrowwallet.frigate.electrum;
++
++import com.github.arteam.simplejsonrpc.client.JsonRpcClient;
++import com.sparrowwallet.frigate.bitcoind.BitcoindClient;
++import com.sparrowwallet.frigate.io.Server;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.util.List;
++import java.util.concurrent.TimeUnit;
++
++/**
++ * Checks that the backend Electrum server follows the same chain as Frigate's node, by comparing one recent header byte for byte:
++ * the backend's blockchain.block.header against the node's getblockheader &lt;hash&gt; false at the same height. Two chains that share
++ * history (the SHA256 chain and the BLAKE2b chain share every block below 961640) differ in every header above their split, so a
++ * recent one settles it, with no hashing and no knowledge of either chain.
++ *
++ * Runs at startup and then periodically, on a connection of its own, and records the answer. Sessions consult the answer at
++ * server.version: a backend on another chain refuses wallets with a reason, while a backend that could not be checked (unreachable,
++ * or still indexing below the height asked for) is not held against them, since its own errors already say what is wrong.
++ */
++public final class BackendChainCheck {
++    private static final Logger log = LoggerFactory.getLogger(BackendChainCheck.class);
++
++    /** How far below the node's tip to compare, so a backend a block or two behind still has the header. */
++    static final int DEPTH = 6;
++    private static final long INTERVAL_MINUTES = 10;
++    private static final long REQUEST_TIMEOUT_MILLIS = TimeUnit.SECONDS.toMillis(60);
++
++    public enum State { UNKNOWN, SAME, DIFFERENT }
++
++    private static volatile State state = State.UNKNOWN;
++    private static volatile Thread thread;
++
++    private BackendChainCheck() {}
++
++    public static State getState() {
++        return state;
++    }
++
++    static void setState(State newState) {
++        state = newState;
++    }
++
++    public static void requireSameChain() throws BackendChainMismatchException {
++        if(state == State.DIFFERENT) {
++            throw new BackendChainMismatchException("backend on a different chain");
++        }
++    }
++
++    public static synchronized void start(BitcoindClient bitcoindClient, Server backend) {
++        if(thread != null || bitcoindClient == null || backend == null) {
++            return;
++        }
++        thread = Thread.ofVirtual().name("BackendChainCheck").start(() -> {
++            while(!Thread.currentThread().isInterrupted()) {
++                record(checkOnce(bitcoindClient, backend));
++                try {
++                    TimeUnit.MINUTES.sleep(INTERVAL_MINUTES);
++                } catch(InterruptedException e) {
++                    return;
++                }
++            }
++        });
++    }
++
++    public static synchronized void stop() {
++        if(thread != null) {
++            thread.interrupt();
++            thread = null;
++        }
++    }
++
++    record Result(State state, String detail) {}
++
++    private static void record(Result result) {
++        State previous = state;
++        state = result.state() == State.UNKNOWN && previous != State.UNKNOWN ? previous : result.state();
++        switch(result.state()) {
++            case SAME -> {
++                if(previous != State.SAME) {
++                    log.info("Backend chain check: the Electrum backend follows the node's chain (" + result.detail() + ")");
++                }
++            }
++            case DIFFERENT -> log.error("Backend chain check FAILED: the Electrum backend follows a different chain from the node (" + result.detail()
++                    + "). Wallets are refused until it is pointed at the same node.");
++            case UNKNOWN -> log.warn("Backend chain check could not run: " + result.detail());
++        }
++    }
++
++    static Result checkOnce(BitcoindClient bitcoindClient, Server backend) {
++        ElectrumTransport transport = new ElectrumTransport(backend.getHostAndPort(), backend.getProtocol(), new Object(), REQUEST_TIMEOUT_MILLIS);
++        try {
++            transport.connect();
++            Thread reader = Thread.ofVirtual().name("BackendChainCheckReader").start(transport::readInputLoop);
++            try {
++                ElectrumBackendService service = new JsonRpcClient(transport).onDemand(ElectrumBackendService.class);
++                service.getServerVersion("Frigate chain check", List.of(ElectrumServerService.MIN_VERSION.get(), ElectrumServerService.PROTOCOL_VERSION_V2.get()));
++                return compare(bitcoindClient, service);
++            } finally {
++                transport.close();
++                reader.interrupt();
++            }
++        } catch(Exception e) {
++            return new Result(State.UNKNOWN, "could not ask the backend at " + backend + " (" + e.getMessage() + ")");
++        }
++    }
++
++    static Result compare(BitcoindClient bitcoindClient, ElectrumBackendService service) {
++        ElectrumBlockHeader tip = bitcoindClient.getTip();
++        if(tip == null) {
++            return new Result(State.UNKNOWN, "the node has no tip yet");
++        }
++        int height = Math.max(0, tip.height() - DEPTH);
++        String nodeHeader = bitcoindClient.getBitcoindService().getBlockHeader(bitcoindClient.getBitcoindService().getBlockHash(height), false);
++        String backendHeader;
++        try {
++            Object answer = service.getBlockHeader(height);
++            backendHeader = answer instanceof String hex ? hex : null;
++        } catch(RuntimeException e) {
++            return new Result(State.UNKNOWN, "the backend has no header at height " + height + " yet (" + e.getMessage() + ")");
++        }
++        if(backendHeader == null) {
++            return new Result(State.UNKNOWN, "the backend answered blockchain.block.header " + height + " with something other than a header");
++        }
++        if(backendHeader.equalsIgnoreCase(nodeHeader)) {
++            return new Result(State.SAME, "header at height " + height + " matches");
++        }
++        return new Result(State.DIFFERENT, "header at height " + height + " is " + abbreviate(backendHeader) + " on the backend and " + abbreviate(nodeHeader) + " on the node");
++    }
++
++    private static String abbreviate(String hex) {
++        return hex.length() <= 24 ? hex : hex.substring(0, 24) + "...(" + hex.length() / 2 + " bytes)";
++    }
++}
+diff --git a/src/main/java/com/sparrowwallet/frigate/electrum/BackendChainMismatchException.java b/src/main/java/com/sparrowwallet/frigate/electrum/BackendChainMismatchException.java
+new file mode 100644
+index 0000000..0ee6e9b
+--- /dev/null
++++ b/src/main/java/com/sparrowwallet/frigate/electrum/BackendChainMismatchException.java
+@@ -0,0 +1,14 @@
++package com.sparrowwallet.frigate.electrum;
++
++import com.github.arteam.simplejsonrpc.core.annotation.JsonRpcError;
++
++/**
++ * The backend Electrum server serves a different chain from Frigate's node, so its address history would belong to one chain and
++ * Frigate's Silent Payments to another. Wallets are refused until the two agree.
++ */
++@JsonRpcError(code = -32603, message = "This server's Electrum backend follows a different chain from its Bitcoin node. Point the backend at the same node.")
++public class BackendChainMismatchException extends Exception {
++    public BackendChainMismatchException(String message) {
++        super(message);
++    }
++}
+diff --git a/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumBackendService.java b/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumBackendService.java
+index 3d094b9..5cf6ef3 100644
+--- a/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumBackendService.java
++++ b/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumBackendService.java
+@@ -52,6 +52,9 @@ public interface ElectrumBackendService {
+     @JsonRpcMethod("blockchain.block.header")
+     Object getBlockHeader(@JsonRpcParam("height") int height, @JsonRpcParam("cp_height") Integer cpHeight);
+ 
++    @JsonRpcMethod("blockchain.block.header")
++    Object getBlockHeader(@JsonRpcParam("height") int height);
++
+     @JsonRpcMethod("blockchain.block.headers")
+     Object getBlockHeaders(@JsonRpcParam("start_height") int startHeight, @JsonRpcParam("count") int count);
+ 
+diff --git a/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumServerService.java b/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumServerService.java
+index 47f6769..9406741 100644
+--- a/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumServerService.java
++++ b/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumServerService.java
+@@ -30,6 +30,11 @@ public class ElectrumServerService {
+     public static final Version MAX_DEFAULT_VERSION = new Version("1.4.2");
+     public static final Version MAX_SUBMIT_PACKAGE_VERSION = new Version("1.6");
+     public static final List<Integer> SILENT_PAYMENTS_SUPPORTED_VERSIONS = List.of(0);
++    /**
++     * The only version negotiated on a chain whose headers are v2: a 1.8 client reads each header's length from bit 31 of its version
++     * field and knows a v2 block is identified by its BLAKE2b hash (docs/electrum-header-v2.md in the electrs-pruned repository).
++     */
++    public static final Version PROTOCOL_VERSION_V2 = new Version("1.8");
+     private static final int METHOD_NOT_FOUND = -32601;
+ 
+     private final BitcoindClient bitcoindClient;
+@@ -39,10 +44,12 @@ public class ElectrumServerService {
+     private Version protocolVersion;
+     private volatile BackendSession.VersionRequest backendVersionRequest;
+     private String genesisHash;
++    private java.util.function.BooleanSupplier chainHasV2Headers;
+ 
+     public ElectrumServerService(BitcoindClient bitcoindClient, RequestHandler requestHandler, IndexQuerier indexQuerier, ElectrumTransport backendTransport) {
+         this.bitcoindClient = bitcoindClient;
+         this.requestHandler = requestHandler;
++        this.chainHasV2Headers = () -> bitcoindClient != null && bitcoindClient.isTipV2();
+         this.indexQuerier = indexQuerier;
+ 
+         if(backendTransport != null) {
+@@ -74,9 +81,43 @@ public class ElectrumServerService {
+         return bitcoindClient != null && bitcoindClient.containsSubmitPackage() ? MAX_SUBMIT_PACKAGE_VERSION : MAX_DEFAULT_VERSION;
+     }
+ 
++    /**
++     * @return true if the node's tip is a v2 header: a chain switches to them at one height and keeps them, so this is the test for
++     * "this chain has v2 headers", with no network name or activation height to configure
++     */
++    boolean chainHasV2Headers() {
++        return chainHasV2Headers.getAsBoolean();
++    }
++
++    /** For tests: stands in for the node's tip. */
++    void setChainHasV2Headers(java.util.function.BooleanSupplier supplier) {
++        this.chainHasV2Headers = supplier;
++    }
++
++    /**
++     * @return the version this session negotiated, or null before server.version
++     */
++    public Version getNegotiatedVersion() {
++        return protocolVersion;
++    }
++
++    /**
++     * Refuses header bytes to a client that cannot read this chain's headers. Checked where headers are served, not only at
++     * server.version, because a chain crosses its activation height while clients are connected (a regtest or freshly synced chain).
++     */
++    private void checkMayServeHeaders() throws HeaderVersionRefusedException {
++        if(chainHasV2Headers() && (protocolVersion == null || protocolVersion.compareTo(PROTOCOL_VERSION_V2) < 0)) {
++            throw new HeaderVersionRefusedException(protocolVersion == null ? "(unnegotiated)" : protocolVersion.get());
++        }
++    }
++
+     @JsonRpcMethod("server.version")
+-    public List<String> getServerVersion(@JsonRpcParam("client_name") String clientName, @JsonRpcParam("protocol_version") Object protocolVersion) throws UnsupportedVersionException {
++    public List<String> getServerVersion(@JsonRpcParam("client_name") String clientName, @JsonRpcParam("protocol_version") Object protocolVersion) throws UnsupportedVersionException, HeaderVersionRefusedException, BackendChainMismatchException {
+         VersionRange requested = VersionRange.of(protocolVersion);
++        if(chainHasV2Headers()) {
++            return getServerVersionV2(clientName, requested);
++        }
++
+         Version maxSupported = getMaxSupportedVersion();
+         if(requested.max().compareTo(MIN_VERSION) < 0 || requested.min().compareTo(maxSupported) > 0) {
+             throw new UnsupportedVersionException(requested.max().get());
+@@ -89,6 +130,7 @@ public class ElectrumServerService {
+ 
+         Version version = cappedMax;
+         if(electrumBackendService != null) {
++            BackendChainCheck.requireSameChain();
+             List<String> backendVersions = electrumBackendService.getServerVersion(clientName, backendRequest);
+             //remembered so a reconnected backend connection can negotiate the same version before resubscribing
+             backendVersionRequest = new BackendSession.VersionRequest(clientName, backendRequest);
+@@ -108,6 +150,31 @@ public class ElectrumServerService {
+         return List.of(Frigate.SERVER_NAME + " " + Frigate.SERVER_VERSION, this.protocolVersion.get());
+     }
+ 
++    /**
++     * Negotiation on a chain with v2 headers: 1.8 only with the client, as Electrs Pruned does. The backend is asked for a range
++     * reaching 1.8 whatever the client's own maximum, because Electrs Pruned refuses anything lower on this chain. A backend that
++     * answers lower (privkeyio's Fulcrum stops at 1.6) still serves this chain's headers, in either of the two reply forms of
++     * blockchain.block.headers, and a 1.8 client must read both. So the client is told 1.8 regardless, and the rule that the backend
++     * never negotiates above what the client was told still holds.
++     */
++    private List<String> getServerVersionV2(String clientName, VersionRange requested) throws HeaderVersionRefusedException, BackendChainMismatchException {
++        if(requested.min().compareTo(PROTOCOL_VERSION_V2) > 0 || requested.max().compareTo(PROTOCOL_VERSION_V2) < 0) {
++            log.info("Refusing client " + clientName + " asking for protocol " + requested.min().get() + " to " + requested.max().get() + " on a chain with v2 headers");
++            throw new HeaderVersionRefusedException(requested.max().get());
++        }
++
++        if(electrumBackendService != null) {
++            BackendChainCheck.requireSameChain();
++            Version backendMin = requested.min().compareTo(MIN_VERSION) < 0 ? MIN_VERSION : requested.min();
++            Object backendRequest = List.of(backendMin.get(), PROTOCOL_VERSION_V2.get());
++            electrumBackendService.getServerVersion(clientName, backendRequest);
++            backendVersionRequest = new BackendSession.VersionRequest(clientName, backendRequest);
++        }
++
++        this.protocolVersion = PROTOCOL_VERSION_V2;
++        return List.of(Frigate.SERVER_NAME + " " + Frigate.SERVER_VERSION, PROTOCOL_VERSION_V2.get());
++    }
++
+     /**
+      * The protocol versions a client accepts: a single version, or a [min, max] range.
+      */
+@@ -141,7 +208,8 @@ public class ElectrumServerService {
+ 
+         if(electrumBackendService != null) {
+             try {
+-                return electrumBackendService.getServerFeatures().withHosts(ourHosts).withSilentPayments(SILENT_PAYMENTS_SUPPORTED_VERSIONS);
++                ServerFeatures features = electrumBackendService.getServerFeatures().withHosts(ourHosts).withSilentPayments(SILENT_PAYMENTS_SUPPORTED_VERSIONS);
++                return withChainIdentity(features);
+             } catch(JsonRpcException e) {
+                 if(e.getErrorMessage() == null || e.getErrorMessage().getCode() != METHOD_NOT_FOUND) {
+                     throw e;
+@@ -150,8 +218,26 @@ public class ElectrumServerService {
+             }
+         }
+ 
+-        return new ServerFeatures(ourHosts, getGenesisHash(), "sha256", Frigate.SERVER_NAME + " " + Frigate.SERVER_VERSION,
+-                protocolVersion.get(), MIN_VERSION.get(), null, SILENT_PAYMENTS_SUPPORTED_VERSIONS);
++        return withChainIdentity(new ServerFeatures(ourHosts, getGenesisHash(), "sha256", Frigate.SERVER_NAME + " " + Frigate.SERVER_VERSION,
++                protocolVersion.get(), MIN_VERSION.get(), null, SILENT_PAYMENTS_SUPPORTED_VERSIONS));
++    }
++
++    /**
++     * On a chain with v2 headers, reports the versions this server negotiates (1.8 only, not the backend's range) and the fork point:
++     * the backend's blake2b_fork when it reports one, else the node's.
++     */
++    private ServerFeatures withChainIdentity(ServerFeatures features) {
++        if(!chainHasV2Headers()) {
++            return features;
++        }
++        ServerFeatures result = features.withProtocol(PROTOCOL_VERSION_V2.get(), PROTOCOL_VERSION_V2.get());
++        if(result.blake2b_fork() == null && bitcoindClient != null) {
++            ServerFeatures.Blake2bFork fork = bitcoindClient.getBlake2bForkPoint();
++            if(fork != null) {
++                result = result.withBlake2bFork(fork);
++            }
++        }
++        return result;
+     }
+ 
+     static Map<String, ServerFeatures.HostInfo> buildAdvertisedHosts(List<Server> servers) {
+@@ -268,8 +354,9 @@ public class ElectrumServerService {
+     }
+ 
+     @JsonRpcMethod("blockchain.headers.subscribe")
+-    public ElectrumBlockHeader subscribeHeaders() {
++    public ElectrumBlockHeader subscribeHeaders() throws HeaderVersionRefusedException {
+         checkVersionNegotiated();
++        checkMayServeHeaders();
+         if(bitcoindClient == null) {
+             throw new UnsupportedOperationException("Configure coreServer to use blockchain.headers.subscribe");
+         }
+@@ -368,8 +455,9 @@ public class ElectrumServerService {
+     }
+ 
+     @JsonRpcMethod("blockchain.block.header")
+-    public Object getBlockHeader(@JsonRpcParam("height") int height, @JsonRpcParam("cp_height") @JsonRpcOptional Integer cpHeight) throws BitcoindIOException, BlockNotFoundException {
++    public Object getBlockHeader(@JsonRpcParam("height") int height, @JsonRpcParam("cp_height") @JsonRpcOptional Integer cpHeight) throws BitcoindIOException, BlockNotFoundException, HeaderVersionRefusedException {
+         checkVersionNegotiated();
++        checkMayServeHeaders();
+         if(cpHeight != null && cpHeight > 0) {
+             if(electrumBackendService != null) {
+                 return electrumBackendService.getBlockHeader(height, cpHeight);
+@@ -392,8 +480,9 @@ public class ElectrumServerService {
+     }
+ 
+     @JsonRpcMethod("blockchain.block.headers")
+-    public Object getBlockHeaders(@JsonRpcParam("start_height") int startHeight, @JsonRpcParam("count") int count, @JsonRpcParam("cp_height") @JsonRpcOptional Integer cpHeight) {
++    public Object getBlockHeaders(@JsonRpcParam("start_height") int startHeight, @JsonRpcParam("count") int count, @JsonRpcParam("cp_height") @JsonRpcOptional Integer cpHeight) throws HeaderVersionRefusedException {
+         checkVersionNegotiated();
++        checkMayServeHeaders();
+         if(electrumBackendService != null) {
+             if(cpHeight != null && cpHeight > 0) {
+                 return electrumBackendService.getBlockHeaders(startHeight, count, cpHeight);
+diff --git a/src/main/java/com/sparrowwallet/frigate/electrum/HeaderVersionRefusedException.java b/src/main/java/com/sparrowwallet/frigate/electrum/HeaderVersionRefusedException.java
+new file mode 100644
+index 0000000..b8f49dd
+--- /dev/null
++++ b/src/main/java/com/sparrowwallet/frigate/electrum/HeaderVersionRefusedException.java
+@@ -0,0 +1,25 @@
++package com.sparrowwallet.frigate.electrum;
++
++import com.github.arteam.simplejsonrpc.core.annotation.JsonRpcError;
++import com.github.arteam.simplejsonrpc.core.annotation.JsonRpcErrorData;
++
++/**
++ * Refuses a client below protocol 1.8 on a chain with v2 headers, at server.version and wherever headers are served. Such a client
++ * would read 80 bytes of a 164 byte header, compute SHA256d over it, and fail to link the chain in a way it reports as a sync problem
++ * rather than an incompatibility. The rule and the wording follow Electrs Pruned (its patch 0006) and docs/electrum-header-v2.md.
++ */
++@JsonRpcError(code = -32003, message = "This chain uses 164-byte block headers with a BLAKE2b block hash, which a client below protocol 1.8 cannot read. "
++        + "Refusing rather than serving headers it would misinterpret. Use a wallet that supports Electrum protocol 1.8.")
++public class HeaderVersionRefusedException extends Exception {
++    @JsonRpcErrorData
++    private final String version;
++
++    public HeaderVersionRefusedException(String version) {
++        super("client at protocol " + version + " refused on a chain with v2 headers");
++        this.version = version;
++    }
++
++    public String getVersion() {
++        return version;
++    }
++}
+diff --git a/src/main/java/com/sparrowwallet/frigate/electrum/RequestHandler.java b/src/main/java/com/sparrowwallet/frigate/electrum/RequestHandler.java
+index bb3e514..a659d6d 100644
+--- a/src/main/java/com/sparrowwallet/frigate/electrum/RequestHandler.java
++++ b/src/main/java/com/sparrowwallet/frigate/electrum/RequestHandler.java
+@@ -1,5 +1,6 @@
+ package com.sparrowwallet.frigate.electrum;
+ 
++import com.sparrowwallet.drongo.Version;
+ import com.github.arteam.simplejsonrpc.server.JsonRpcServer;
+ import com.google.common.eventbus.Subscribe;
+ import com.sparrowwallet.drongo.protocol.Sha256Hash;
+@@ -529,6 +530,15 @@ public class RequestHandler implements Runnable, SubscriptionStatus, HeadersDisp
+ 
+     @Override
+     public void notifyHeaders(ElectrumBlockHeader electrumBlockHeader) {
++        Version negotiated = electrumServerService.getNegotiatedVersion();
++        if(electrumBlockHeader.isV2() && (negotiated == null || negotiated.compareTo(ElectrumServerService.PROTOCOL_VERSION_V2) < 0)) {
++            //the chain crossed its activation height under a client that negotiated below 1.8: disconnect it rather than send a header
++            //it would misread. It reconnects into the refusal at server.version, which says why
++            log.info("Disconnecting a client at protocol " + (negotiated == null ? "(unnegotiated)" : negotiated.get()) + ": the chain tip at height "
++                    + electrumBlockHeader.height() + " is a v2 header, which it cannot read");
++            Thread.ofVirtual().name("ElectrumDisconnect-" + System.identityHashCode(this)).start(() -> closeClientSocket(true));
++            return;
++        }
+         notifier.notify(() -> notificationService.notifyHeaders(electrumBlockHeader));
+     }
+ 
+diff --git a/src/main/java/com/sparrowwallet/frigate/electrum/ServerFeatures.java b/src/main/java/com/sparrowwallet/frigate/electrum/ServerFeatures.java
+index 96bf188..cb3d614 100644
+--- a/src/main/java/com/sparrowwallet/frigate/electrum/ServerFeatures.java
++++ b/src/main/java/com/sparrowwallet/frigate/electrum/ServerFeatures.java
+@@ -9,7 +9,24 @@ import java.util.Map;
+ 
+ @JsonInclude(JsonInclude.Include.NON_NULL)
+ @JsonIgnoreProperties(ignoreUnknown = true)
+-public record ServerFeatures(Map<String, HostInfo> hosts, String genesis_hash, String hash_function, String server_version, String protocol_max, String protocol_min, Integer pruning, List<Integer> silent_payments) {
++public record ServerFeatures(Map<String, HostInfo> hosts, String genesis_hash, String hash_function, String server_version, String protocol_max, String protocol_min, Integer pruning, List<Integer> silent_payments, Blake2bFork blake2b_fork) {
++    public ServerFeatures(Map<String, HostInfo> hosts, String genesis_hash, String hash_function, String server_version, String protocol_max, String protocol_min, Integer pruning, List<Integer> silent_payments) {
++        this(hosts, genesis_hash, hash_function, server_version, protocol_max, protocol_min, pruning, silent_payments, null);
++    }
++
++    /**
++     * Which side of the BLAKE2b fork a server follows, in the shape Electrs Pruned and Fulcrum Pruned report it: the first v2 header's
++     * height and block hash. Absent on a chain with no v2 header. genesis_hash cannot say this, because the forked chain keeps the
++     * original's history. Passed through from the backend (or computed from the node), since wallets cross-check it.
++     */
++    @JsonInclude(JsonInclude.Include.NON_NULL)
++    @JsonIgnoreProperties(ignoreUnknown = true)
++    public record Blake2bFork(Integer height, String hash, Integer header_bytes, String block_hash) {
++        public static Blake2bFork of(int height, String hash) {
++            return new Blake2bFork(height, hash, 164, "blake2b");
++        }
++    }
++
+     @JsonIgnoreProperties(ignoreUnknown = true)
+     public record HostInfo(Integer tcp_port, Integer ssl_port) {
+         //Some non-conformant Electrum servers return hosts as {"host": <port>} instead of
+@@ -22,10 +39,18 @@ public record ServerFeatures(Map<String, HostInfo> hosts, String genesis_hash, S
+     }
+ 
+     public ServerFeatures withSilentPayments(List<Integer> versions) {
+-        return new ServerFeatures(hosts, genesis_hash, hash_function, server_version, protocol_max, protocol_min, pruning, versions);
++        return new ServerFeatures(hosts, genesis_hash, hash_function, server_version, protocol_max, protocol_min, pruning, versions, blake2b_fork);
+     }
+ 
+     public ServerFeatures withHosts(Map<String, HostInfo> hosts) {
+-        return new ServerFeatures(hosts, genesis_hash, hash_function, server_version, protocol_max, protocol_min, pruning, silent_payments);
++        return new ServerFeatures(hosts, genesis_hash, hash_function, server_version, protocol_max, protocol_min, pruning, silent_payments, blake2b_fork);
++    }
++
++    public ServerFeatures withProtocol(String min, String max) {
++        return new ServerFeatures(hosts, genesis_hash, hash_function, server_version, max, min, pruning, silent_payments, blake2b_fork);
++    }
++
++    public ServerFeatures withBlake2bFork(Blake2bFork fork) {
++        return new ServerFeatures(hosts, genesis_hash, hash_function, server_version, protocol_max, protocol_min, pruning, silent_payments, fork);
+     }
+ }
+diff --git a/src/main/java/com/sparrowwallet/frigate/io/Config.java b/src/main/java/com/sparrowwallet/frigate/io/Config.java
+index d0d91a3..fd71b8c 100644
+--- a/src/main/java/com/sparrowwallet/frigate/io/Config.java
++++ b/src/main/java/com/sparrowwallet/frigate/io/Config.java
+@@ -694,7 +694,8 @@ public class Config {
+ 
+         @JsonIgnore
+         public Server getBackendElectrumServerObj() {
+-            return backendElectrumServer != null ? Server.fromString(backendElectrumServer) : null;
++            //blank means none, as a package writes it when no backend is selected; Server.fromString refuses an empty url
++            return backendElectrumServer != null && !backendElectrumServer.isBlank() ? Server.fromString(backendElectrumServer) : null;
+         }
+ 
+         public int getBackendRequestTimeoutSeconds() {
+diff --git a/src/test/java/com/sparrowwallet/frigate/electrum/ProtocolV2Test.java b/src/test/java/com/sparrowwallet/frigate/electrum/ProtocolV2Test.java
+new file mode 100644
+index 0000000..d3c992f
+--- /dev/null
++++ b/src/test/java/com/sparrowwallet/frigate/electrum/ProtocolV2Test.java
+@@ -0,0 +1,139 @@
++package com.sparrowwallet.frigate.electrum;
++
++import com.google.common.net.HostAndPort;
++import com.sparrowwallet.frigate.io.Protocol;
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++
++import java.net.URI;
++import java.util.List;
++import java.util.concurrent.atomic.AtomicBoolean;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++/**
++ * Negotiation on a chain with v2 headers: 1.8 only toward wallets, a range reaching 1.8 toward the backend, and headers refused to a
++ * session below 1.8. On any other chain, negotiation is upstream's.
++ */
++public class ProtocolV2Test {
++    private final AtomicBoolean v2 = new AtomicBoolean(true);
++
++    @BeforeEach
++    public void reset() {
++        BackendChainCheck.setState(BackendChainCheck.State.UNKNOWN);
++    }
++
++    @AfterEach
++    public void after() {
++        BackendChainCheck.setState(BackendChainCheck.State.UNKNOWN);
++    }
++
++    private ElectrumServerService service(ElectrumTransport backend) {
++        ElectrumServerService service = new ElectrumServerService(null, null, null, backend);
++        service.setChainHasV2Headers(v2::get);
++        return service;
++    }
++
++    @Test
++    public void v2ChainNegotiatesOnly18() throws Exception {
++        assertEquals("1.8", service(null).getServerVersion("test", "1.8").get(1));
++        assertEquals("1.8", service(null).getServerVersion("test", List.of("1.3", "1.8")).get(1));
++        assertEquals("1.8", service(null).getServerVersion("test", List.of("1.4", "2.0")).get(1));
++        assertThrows(HeaderVersionRefusedException.class, () -> service(null).getServerVersion("test", List.of("1.4", "1.6")));
++        assertThrows(HeaderVersionRefusedException.class, () -> service(null).getServerVersion("test", "1.4"));
++        assertThrows(HeaderVersionRefusedException.class, () -> service(null).getServerVersion("test", List.of("1.9", "2.0")));
++    }
++
++    @Test
++    public void otherChainsNegotiateAsUpstream() throws Exception {
++        v2.set(false);
++        assertEquals("1.4.2", service(null).getServerVersion("test", List.of("1.3", "1.8")).get(1));
++        assertEquals("1.4", service(null).getServerVersion("test", "1.4").get(1));
++    }
++
++    @Test
++    public void headersRefusedBelow18OnV2Chain() throws Exception {
++        v2.set(false);
++        ElectrumServerService service = service(null);
++        service.getServerVersion("test", "1.4");
++        //the chain crosses its activation height under the session
++        v2.set(true);
++        assertThrows(HeaderVersionRefusedException.class, service::subscribeHeaders);
++        assertThrows(HeaderVersionRefusedException.class, () -> service.getBlockHeader(1, null));
++        assertThrows(HeaderVersionRefusedException.class, () -> service.getBlockHeaders(1, 1, null));
++    }
++
++    @Test
++    public void headersServedAt18OnV2Chain() throws Exception {
++        ElectrumServerService service = service(null);
++        service.getServerVersion("test", List.of("1.3", "1.8"));
++        //past the version rule: with no node configured, the method itself is what refuses
++        assertThrows(UnsupportedOperationException.class, service::subscribeHeaders);
++    }
++
++    @Test
++    public void backendAskedForARangeReaching18() throws Exception {
++        try(FakeElectrumBackend backend = new FakeElectrumBackend()) {
++            //privkeyio's Fulcrum stops at 1.6, Electrs Pruned at 1.8 on this chain: either way the client is told 1.8
++            for(String backendMax : List.of("1.6", "1.8")) {
++                backend.setMaxProtocolVersion(backendMax);
++                URI uri = URI.create(backend.getUrl());
++                try(ElectrumTransport transport = new ElectrumTransport(HostAndPort.fromParts(uri.getHost(), uri.getPort()), Protocol.TCP, new Object())) {
++                    transport.connect();
++                    Thread.ofVirtual().start(transport::readInputLoop);
++                    assertEquals("1.8", service(transport).getServerVersion("test", List.of("1.3", "1.8")).get(1));
++                }
++            }
++            assertEquals(2, backend.getVersionRequests().size());
++            for(var request : backend.getVersionRequests()) {
++                assertEquals("1.4", request.path(0).asText());
++                assertEquals("1.8", request.path(1).asText());
++            }
++        }
++    }
++
++    @Test
++    public void backendOnAnotherChainRefusesWallets() {
++        BackendChainCheck.setState(BackendChainCheck.State.DIFFERENT);
++        try(FakeElectrumBackend backend = new FakeElectrumBackend()) {
++            URI uri = URI.create(backend.getUrl());
++            try(ElectrumTransport transport = new ElectrumTransport(HostAndPort.fromParts(uri.getHost(), uri.getPort()), Protocol.TCP, new Object())) {
++                transport.connect();
++                Thread.ofVirtual().start(transport::readInputLoop);
++                assertThrows(BackendChainMismatchException.class, () -> service(transport).getServerVersion("test", List.of("1.3", "1.8")));
++                v2.set(false);
++                assertThrows(BackendChainMismatchException.class, () -> service(transport).getServerVersion("test", "1.4"));
++            }
++        } catch(Exception e) {
++            fail(e);
++        }
++    }
++
++    @Test
++    public void featuresReport18AndForkPointOnV2Chain() throws Exception {
++        ServerFeatures features = new ServerFeatures(null, "00", "sha256", "x", "1.6", "1.4", null, null,
++                ServerFeatures.Blake2bFork.of(961640, "0000000000000050c1e5f69672f459293be14f46e5a494e7a8c8541396f18eeb"));
++        ServerFeatures result = features.withProtocol("1.8", "1.8");
++        assertEquals("1.8", result.protocol_min());
++        assertEquals("1.8", result.protocol_max());
++        assertEquals(961640, result.blake2b_fork().height());
++        assertEquals(164, result.blake2b_fork().header_bytes());
++        assertEquals("blake2b", result.blake2b_fork().block_hash());
++        assertEquals(961640, result.withHosts(java.util.Map.of()).withSilentPayments(List.of(0)).blake2b_fork().height());
++    }
++
++    @Test
++    public void backendForkPointPassesThroughJson() throws Exception {
++        com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
++        String backend = "{\"genesis_hash\":\"00\",\"hash_function\":\"sha256\",\"protocol_max\":\"1.8\",\"protocol_min\":\"1.4\",\"server_version\":\"Fulcrum 2.1.4\","
++                + "\"blake2b_fork\":{\"height\":961640,\"hash\":\"0000000000000050c1e5f69672f459293be14f46e5a494e7a8c8541396f18eeb\",\"header_bytes\":164,\"block_hash\":\"blake2b\"},\"dsproof\":false}";
++        ServerFeatures features = mapper.readValue(backend, ServerFeatures.class);
++        assertEquals(961640, features.blake2b_fork().height());
++        String out = mapper.writeValueAsString(features.withSilentPayments(List.of(0)));
++        assertTrue(out.contains("\"blake2b_fork\":{\"height\":961640"), out);
++
++        String sha256 = "{\"genesis_hash\":\"00\",\"protocol_max\":\"1.4\",\"protocol_min\":\"1.4\"}";
++        assertFalse(mapper.writeValueAsString(mapper.readValue(sha256, ServerFeatures.class)).contains("blake2b_fork"));
++    }
++}

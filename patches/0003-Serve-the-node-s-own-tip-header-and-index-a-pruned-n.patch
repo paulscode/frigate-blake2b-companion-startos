@@ -1,0 +1,541 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Paul Lamb <paul@paulscode.com>
+Date: Sun, 8 Nov 2026 23:26:55 -0600
+Subject: [PATCH 3/4] Serve the node's own tip header, and index a pruned node
+
+Two changes that let Frigate run where it could not before, neither tied
+to one chain.
+
+The tip sent to wallets by blockchain.headers.subscribe was rebuilt from
+getblockheader's JSON fields, which can only produce an 80-byte header.
+On the BLAKE2b chain every header from 961640 is 164 bytes and the
+rebuilt one hashes to nothing. It now comes from getblockheader <hash>
+false, the node's own serialization at its true length, and must hash to
+the block it was asked for. The approach follows BitcoinMechanic's
+frigate-knots.patch in BitcoinMechanic/frigate-startos. getblockheader's
+difficulty is boxed, since a BLAKE2b node omits it for v2 blocks.
+
+A pruned node was forced onto the legacy path, which looks every spent
+output up with getrawtransaction and so needs -txindex, which a node
+refuses while pruning. getblock verbosity 3 carries the prevouts from the
+block's undo data, and a pruned node keeps undo data for every block it
+holds, so it is now used on pruned nodes too:
+
+- a new index starts at the node's prune height (plus a small margin)
+  instead of a height the node cannot serve, says so in the log, and
+  records its start beside the database (db/start-height);
+- an index whose next block the node has pruned since stops with a FATAL
+  line naming the block and the remedy, rather than skipping it: a gap is
+  a payment a wallet would silently not see. While a new index has not
+  indexed its first block yet, it moves its start up instead;
+- a mempool transaction's confirmed prevouts come from gettxout with
+  include_mempool false (true hides an output already spent in the
+  mempool, which is exactly the one being looked up); mempool parents
+  still come from getrawtransaction, which needs no -txindex for them.
+
+btc-rpc-proxy, which fronts a pruned node's RPC, intercepts getblock only
+at verbosity 0 and 1, so verbosity 3 always reaches the node, and a
+pruned block is refused there rather than served without prevouts.
+---
+ .../com/sparrowwallet/frigate/Frigate.java    |   4 +-
+ .../frigate/bitcoind/BitcoindClient.java      | 135 ++++++++++++++++--
+ .../bitcoind/BitcoindClientService.java       |   3 +
+ .../bitcoind/PrunedBlockException.java        |  26 ++++
+ .../sparrowwallet/frigate/bitcoind/TxOut.java |  13 ++
+ .../frigate/bitcoind/VerboseBlockHeader.java  |   3 +-
+ .../frigate/electrum/ElectrumBlockHeader.java |  20 +++
+ .../sparrowwallet/frigate/index/Index.java    |  55 +++++++
+ .../electrum/ElectrumBlockHeaderTest.java     |  55 +++++++
+ 9 files changed, 301 insertions(+), 13 deletions(-)
+ create mode 100644 src/main/java/com/sparrowwallet/frigate/bitcoind/PrunedBlockException.java
+ create mode 100644 src/main/java/com/sparrowwallet/frigate/bitcoind/TxOut.java
+ create mode 100644 src/test/java/com/sparrowwallet/frigate/electrum/ElectrumBlockHeaderTest.java
+
+diff --git a/src/main/java/com/sparrowwallet/frigate/Frigate.java b/src/main/java/com/sparrowwallet/frigate/Frigate.java
+index 0e95f5c..5c69da1 100644
+--- a/src/main/java/com/sparrowwallet/frigate/Frigate.java
++++ b/src/main/java/com/sparrowwallet/frigate/Frigate.java
+@@ -214,7 +214,9 @@ public class Frigate {
+             frigate.start();
+         } catch(Exception e) {
+             String message = getOperationalErrorMessage(e);
+-            if(message != null) {
++            if(e instanceof com.sparrowwallet.frigate.bitcoind.PrunedBlockException) {
++                getLogger().error("FATAL: " + e.getMessage());
++            } else if(message != null) {
+                 getLogger().error(message);
+             } else {
+                 getLogger().error("Fatal error", e);
+diff --git a/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java b/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java
+index 6b957ce..31726c4 100644
+--- a/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java
++++ b/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClient.java
+@@ -43,6 +43,9 @@ public class BitcoindClient {
+     private static final int MAX_REORG_DEPTH = 10;
+     private static final int RPC_INVALID_ADDRESS_OR_KEY = -5;
+     private static final int MIN_GETBLOCK_VERBOSE_VERSION = 250000;
++    //blocks above a pruned node's prune height that a new index skips, so the node's next prune (which drops whole block files at a
++    //time) does not take the first blocks before they are indexed
++    static final int PRUNE_MARGIN = 6;
+     public static final int MIN_SUBMIT_PACKAGE_VERSION = 280000;
+ 
+     private static final int FLUSH_BATCH_SIZE = 50;
+@@ -65,6 +68,9 @@ public class BitcoindClient {
+     private String lastBlock;
+     private volatile ElectrumBlockHeader tip;
+     private volatile boolean useGetBlockVerbose;
++    private volatile boolean pruned;
++    private volatile int pruneHeight;
++    private volatile boolean initialBuild;
+ 
+     private Exception lastPollException;
+ 
+@@ -134,13 +140,19 @@ public class BitcoindClient {
+         networkInfo = getBitcoindService().getNetworkInfo();
+ 
+         BlockchainInfo blockchainInfo = getBitcoindService().getBlockchainInfo();
+-        useGetBlockVerbose = networkInfo.version() >= MIN_GETBLOCK_VERBOSE_VERSION && !blockchainInfo.pruned();
++        //verbosity 3 carries every input's prevout, read from the block's undo data. A pruned node keeps undo data for every block it
++        //still holds, so it serves verbosity 3 for exactly the blocks it can serve at all. The legacy path instead looks each prevout up
++        //with getrawtransaction, which needs -txindex, and a node refuses -txindex while pruning.
++        useGetBlockVerbose = networkInfo.version() >= MIN_GETBLOCK_VERBOSE_VERSION;
++        pruned = blockchainInfo.pruned();
+         if(useGetBlockVerbose) {
+             log.debug("Using getblock verbosity=3 (Bitcoin Core {})", networkInfo.version());
++        } else if(pruned) {
++            throw new IllegalStateException("A pruned node must be Bitcoin Core or Knots 25.0 or later, which serve getblock verbosity 3: " +
++                    "this node is version " + networkInfo.version());
+         }
+ 
+-        VerboseBlockHeader blockHeader = getBitcoindService().getBlockHeader(blockchainInfo.bestblockhash());
+-        tip = blockHeader.getBlockHeader();
++        tip = getTipHeader(blockchainInfo);
+         timer.schedule(new PollTask(), 5000, 5000);
+ 
+         if(blockchainInfo.initialblockdownload() && networkInfo.networkactive()) {
+@@ -163,8 +175,7 @@ public class BitcoindClient {
+             }
+ 
+             blockchainInfo = getBitcoindService().getBlockchainInfo();
+-            blockHeader = getBitcoindService().getBlockHeader(blockchainInfo.bestblockhash());
+-            tip = blockHeader.getBlockHeader();
++            tip = getTipHeader(blockchainInfo);
+         }
+ 
+         lastBlock = blockchainInfo.bestblockhash();
+@@ -184,7 +195,16 @@ public class BitcoindClient {
+             }
+         }
+ 
++        blockchainInfo = getBitcoindService().getBlockchainInfo();
++        if(pruned) {
++            startFromPrunedNode(blockchainInfo);
++        }
++
+         int startHeight = blocksIndex.getLastBlockIndexed() + 1;
++        int indexStart = blocksIndex.recordStartHeight(startHeight);
++        if(indexStart >= 0) {
++            log.info("Silent Payments index starts at block {}", indexStart);
++        }
+         int endHeight = tip.height();
+         int blocksToIndex = endHeight - startHeight + 1;
+         if(blocksToIndex > 0) {
+@@ -200,6 +220,7 @@ public class BitcoindClient {
+             log.info("Indexed {} blocks in {}.{}s ({} blocks/sec)", blocksToIndex, elapsedMs / 1000, String.format(Locale.ROOT, "%03d", elapsedMs % 1000), String.format(Locale.ROOT, "%.1f", blocksPerSec));
+         }
+         blocksIndex.setSteadyState(true);
++        initialBuild = false;
+         updateMempoolIndex();
+         lastMempoolDiffMs = System.currentTimeMillis();
+         publishTip();
+@@ -227,6 +248,67 @@ public class BitcoindClient {
+         }
+     }
+ 
++    /**
++     * The tip as wallets receive it from blockchain.headers.subscribe: the node's own serialization of the header, at whatever
++     * length it has (80 bytes, or 164 for a v2 header on the BLAKE2b chain), rather than one rebuilt from getblockheader's JSON
++     * fields, which can only ever produce an 80 byte header and on a v2 chain produces one that hashes to nothing. The parsed
++     * header must hash to the block it was asked for, so a header drongo misreads fails here rather than at the wallet.
++     */
++    private ElectrumBlockHeader getTipHeader(BlockchainInfo blockchainInfo) {
++        String headerHex = getBitcoindService().getBlockHeader(blockchainInfo.bestblockhash(), false);
++        BlockHeader blockHeader = new BlockHeader(HexFormat.of().parseHex(headerHex));
++        if(!blockHeader.getHash().toString().equals(blockchainInfo.bestblockhash())) {
++            throw new IllegalStateException("Bitcoin Core returned a header for " + blockchainInfo.bestblockhash() + " that hashes to " + blockHeader.getHash());
++        }
++        return new ElectrumBlockHeader(blockchainInfo.blocks(), headerHex);
++    }
++
++    /**
++     * @return true if the current tip is a v2 (BLAKE2b, 164 byte) header, which is the test for "this chain has v2 headers":
++     * a chain activates them at one height and keeps them from there
++     */
++    public boolean isTipV2() {
++        ElectrumBlockHeader current = tip;
++        return current != null && ElectrumBlockHeader.isV2(current.hex());
++    }
++
++    /**
++     * On a pruned node, starts a new index at the node's prune height rather than at a height the node can no longer serve, and refuses
++     * to continue an index whose next block the node has pruned since.
++     */
++    private void startFromPrunedNode(BlockchainInfo blockchainInfo) {
++        pruneHeight = blockchainInfo.pruneheight() == null ? 0 : blockchainInfo.pruneheight();
++        int next = blocksIndex.getLastBlockIndexed() + 1;
++        initialBuild = !blocksIndex.hasIndexedBlocks();
++        if(next >= pruneHeight) {
++            log.info("Pruned node: it keeps blocks from {}, and this index continues from {}", pruneHeight, next);
++            return;
++        }
++
++        if(initialBuild) {
++            int start = Math.min(pruneHeight + PRUNE_MARGIN, tip.height());
++            log.warn("Pruned node: it keeps blocks from {}, so this index starts at block {} rather than {}. Silent Payments received before " +
++                    "block {} will not be found. A larger prune target on the node keeps more blocks.", pruneHeight, start, next, start);
++            blocksIndex.raiseStartHeight(start);
++        } else {
++            throw new PrunedBlockException(next, pruneHeight, null);
++        }
++    }
++
++    /**
++     * A getblock for a block the node has pruned. Core and Knots answer "Block not available (pruned data)"; btc-rpc-proxy passes
++     * verbosity 3 straight to the node, since peers cannot supply undo data, so the answer is the node's.
++     */
++    private static boolean isPrunedBlockError(Throwable e) {
++        for(Throwable t = e; t != null; t = t.getCause()) {
++            if(t instanceof JsonRpcException jre && jre.getErrorMessage() != null && jre.getErrorMessage().getMessage() != null
++                    && jre.getErrorMessage().getMessage().contains("pruned")) {
++                return true;
++            }
++        }
++        return false;
++    }
++
+     private synchronized void updateBlocksIndex() {
+         HexFormat hexFormat = HexFormat.of();
+ 
+@@ -236,10 +318,27 @@ public class BitcoindClient {
+         long lastLogTime = System.currentTimeMillis();
+ 
+         for(int i = startHeight; i <= maxHeight; i++) {
+-            if(useGetBlockVerbose) {
+-                indexBlockVerbose(i, hexFormat);
+-            } else {
+-                indexBlockLegacy(i, hexFormat);
++            try {
++                if(useGetBlockVerbose) {
++                    indexBlockVerbose(i, hexFormat);
++                } else {
++                    indexBlockLegacy(i, hexFormat);
++                }
++            } catch(RuntimeException e) {
++                if(!pruned || !isPrunedBlockError(e)) {
++                    throw e;
++                }
++                BlockchainInfo blockchainInfo = getBitcoindService().getBlockchainInfo();
++                pruneHeight = blockchainInfo.pruneheight() == null ? pruneHeight : blockchainInfo.pruneheight();
++                if(initialBuild && !blocksIndex.hasIndexedBlocks() && i < pruneHeight) {
++                    //the node pruned past the start of an index that has not indexed a block yet: start it where the node's blocks now start
++                    int start = Math.min(pruneHeight + PRUNE_MARGIN, maxHeight);
++                    log.warn("The node pruned block {} before it could be indexed, so this index now starts at block {}", i, start);
++                    blocksIndex.raiseStartHeight(start);
++                    i = start - 1;
++                    continue;
++                }
++                throw new PrunedBlockException(i, pruneHeight, e);
+             }
+ 
+             long now = System.currentTimeMillis();
+@@ -700,6 +799,17 @@ public class BitcoindClient {
+      */
+     private Script getScriptPubKey(BitcoindClientService bitcoindClientService, HexFormat hexFormat, HashIndex hashIndex, boolean retry) {
+         Script scriptPubKey = getFromScriptPubKeyCache(hashIndex);
++        if(scriptPubKey == null && pruned) {
++            //without -txindex, which a pruned node cannot have, getrawtransaction finds only mempool transactions. The output a mempool
++            //transaction spends from a confirmed one is still in the UTXO set: include_mempool must be false, because with true an output
++            //already spent in the mempool is reported as spent, and that is exactly the output being looked up
++            TxOut txOut = bitcoindClientService.getTxOut(hashIndex.getHash().toString(), (int)hashIndex.getIndex(), false);
++            if(txOut != null && txOut.scriptPubKey() != null && txOut.scriptPubKey().hex() != null) {
++                byte[] spkBytes = hexFormat.parseHex(txOut.scriptPubKey().hex());
++                addtoScriptPubKeyCache(hashIndex.getHash(), (int)hashIndex.getIndex(), spkBytes);
++                return new Script(spkBytes);
++            }
++        }
+         if(scriptPubKey == null) {
+             try {
+                 Supplier<String> fetch = () -> (String)bitcoindClientService.getRawTransaction(hashIndex.getHash().toString(), false);
+@@ -796,8 +906,7 @@ public class BitcoindClient {
+                 String currentBlock = lastBlock;
+ 
+                 if(currentBlock == null || !currentBlock.equals(blockchainInfo.bestblockhash())) {
+-                    VerboseBlockHeader blockHeader = getBitcoindService().getBlockHeader(blockchainInfo.bestblockhash());
+-                    tip = blockHeader.getBlockHeader();
++                    tip = getTipHeader(blockchainInfo);
+                     log.debug("New block height " + tip.height());
+                     publishTip();
+                     updateBlocksIndex();
+@@ -813,6 +922,10 @@ public class BitcoindClient {
+                 }
+ 
+                 lastBlock = blockchainInfo.bestblockhash();
++            } catch(PrunedBlockException e) {
++                //not a transient error: the index cannot continue, and serving it as current would hide payments in later blocks
++                log.error("FATAL: " + e.getMessage());
++                System.exit(3);
+             } catch(Exception e) {
+                 lastPollException = e;
+                 log.warn("Error polling Bitcoin Core", e);
+diff --git a/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClientService.java b/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClientService.java
+index eb675ab..7a8284b 100644
+--- a/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClientService.java
++++ b/src/main/java/com/sparrowwallet/frigate/bitcoind/BitcoindClientService.java
+@@ -57,6 +57,9 @@ public interface BitcoindClientService {
+     @JsonRpcMethod("getblock")
+     VerboseBlock getVerboseBlock(@JsonRpcParam("blockhash") String blockhash, @JsonRpcParam("verbosity") int verbosity);
+ 
++    @JsonRpcMethod("gettxout")
++    TxOut getTxOut(@JsonRpcParam("txid") String txid, @JsonRpcParam("n") int n, @JsonRpcParam("include_mempool") boolean includeMempool);
++
+     @JsonRpcMethod("getrawtransaction")
+     Object getRawTransaction(@JsonRpcParam("txid") String txid, @JsonRpcParam("verbose") boolean verbose);
+ 
+diff --git a/src/main/java/com/sparrowwallet/frigate/bitcoind/PrunedBlockException.java b/src/main/java/com/sparrowwallet/frigate/bitcoind/PrunedBlockException.java
+new file mode 100644
+index 0000000..8aa6115
+--- /dev/null
++++ b/src/main/java/com/sparrowwallet/frigate/bitcoind/PrunedBlockException.java
+@@ -0,0 +1,26 @@
++package com.sparrowwallet.frigate.bitcoind;
++
++/**
++ * A block the index needs is one the node has pruned, together with the undo data that holds its spent outputs. Silent Payments
++ * need those outputs, and no peer can supply them, so the index cannot continue past this block. Never skipped: a gap in the index
++ * is a payment a wallet would silently not see.
++ */
++public class PrunedBlockException extends RuntimeException {
++    private final int height;
++    private final int pruneHeight;
++
++    public PrunedBlockException(int height, int pruneHeight, Throwable cause) {
++        super("The node has pruned block " + height + " (it now keeps blocks from " + pruneHeight + "), which this index still needs. " +
++                "Rebuild the index to start it again from the node's prune height, or raise the node's prune target so it keeps more blocks.", cause);
++        this.height = height;
++        this.pruneHeight = pruneHeight;
++    }
++
++    public int getHeight() {
++        return height;
++    }
++
++    public int getPruneHeight() {
++        return pruneHeight;
++    }
++}
+diff --git a/src/main/java/com/sparrowwallet/frigate/bitcoind/TxOut.java b/src/main/java/com/sparrowwallet/frigate/bitcoind/TxOut.java
+new file mode 100644
+index 0000000..3116500
+--- /dev/null
++++ b/src/main/java/com/sparrowwallet/frigate/bitcoind/TxOut.java
+@@ -0,0 +1,13 @@
++package com.sparrowwallet.frigate.bitcoind;
++
++import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
++
++/**
++ * The part of gettxout's answer Frigate reads. gettxout answers from the node's UTXO set, which a pruned node keeps in full, so it
++ * finds the output a mempool transaction spends without -txindex. It answers null for an output that is spent, or that never existed.
++ */
++@JsonIgnoreProperties(ignoreUnknown = true)
++public record TxOut(String bestblock, Integer confirmations, ScriptPubKey scriptPubKey) {
++    @JsonIgnoreProperties(ignoreUnknown = true)
++    public record ScriptPubKey(String hex) {}
++}
+diff --git a/src/main/java/com/sparrowwallet/frigate/bitcoind/VerboseBlockHeader.java b/src/main/java/com/sparrowwallet/frigate/bitcoind/VerboseBlockHeader.java
+index 19300ac..de16c99 100644
+--- a/src/main/java/com/sparrowwallet/frigate/bitcoind/VerboseBlockHeader.java
++++ b/src/main/java/com/sparrowwallet/frigate/bitcoind/VerboseBlockHeader.java
+@@ -8,9 +8,10 @@ import com.sparrowwallet.frigate.electrum.ElectrumBlockHeader;
+ 
+ import java.math.BigInteger;
+ 
++//difficulty is boxed: a BLAKE2b node reports difficulty_blake2b instead for v2 blocks and omits this field
+ @JsonIgnoreProperties(ignoreUnknown = true)
+ public record VerboseBlockHeader(String hash, int confirmations, int height, int version, String versionHex, String merkleroot, long time, long mediantime, long nonce,
+-                                 String bits, double difficulty, String chainwork, int nTx, String previousblockhash) {
++                                 String bits, Double difficulty, String chainwork, int nTx, String previousblockhash) {
+     public ElectrumBlockHeader getBlockHeader() {
+         BigInteger nBits = new BigInteger(bits, 16);
+         BlockHeader blockHeader = new BlockHeader(version, previousblockhash == null ? Sha256Hash.ZERO_HASH : Sha256Hash.wrap(previousblockhash), Sha256Hash.wrap(merkleroot), null, time, nBits.longValue(), nonce);
+diff --git a/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumBlockHeader.java b/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumBlockHeader.java
+index dfb0d96..8eaa715 100644
+--- a/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumBlockHeader.java
++++ b/src/main/java/com/sparrowwallet/frigate/electrum/ElectrumBlockHeader.java
+@@ -1,5 +1,25 @@
+ package com.sparrowwallet.frigate.electrum;
+ 
++import com.fasterxml.jackson.annotation.JsonIgnore;
++
+ public record ElectrumBlockHeader(int height, String hex) {
++    /**
++     * Bit 31 of the version field marks a v2 header (164 bytes, BLAKE2b proof of work). The version is the first four bytes,
++     * little endian, so the bit is the top bit of the fourth byte.
++     *
++     * @param hex a serialized block header
++     * @return true if it is a v2 header, read from its version field, which is how a header says how long it is
++     */
++    public static boolean isV2(String hex) {
++        if(hex == null || hex.length() < 8) {
++            return false;
++        }
++        int lastVersionByte = Integer.parseInt(hex.substring(6, 8), 16);
++        return (lastVersionByte & 0x80) != 0;
++    }
+ 
++    @JsonIgnore //not part of the header as sent to wallets
++    public boolean isV2() {
++        return isV2(hex);
++    }
+ }
+diff --git a/src/main/java/com/sparrowwallet/frigate/index/Index.java b/src/main/java/com/sparrowwallet/frigate/index/Index.java
+index 92ca0ee..531e158 100644
+--- a/src/main/java/com/sparrowwallet/frigate/index/Index.java
++++ b/src/main/java/com/sparrowwallet/frigate/index/Index.java
+@@ -23,6 +23,8 @@ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
+ import java.io.File;
++import java.io.IOException;
++import java.nio.file.Files;
+ import java.lang.ref.WeakReference;
+ import java.math.BigInteger;
+ import java.sql.*;
+@@ -52,6 +54,8 @@ public class Index {
+     private final ECKey auditSpendKey;
+     private volatile boolean steadyState = false;
+ 
++    public static final String START_HEIGHT_FILENAME = "start-height";
++
+     public Index(int startHeight, boolean inMemory, int batchSize) {
+         lastBlockIndexed.accumulateAndGet(startHeight - 1, Math::max);
+         this.batchSize = batchSize;
+@@ -201,6 +205,57 @@ public class Index {
+         }
+     }
+ 
++    /**
++     * @return true once a block has been indexed into this database (the persisted marker exists), false for an index that has never
++     * indexed anything, whose start height can still be moved without leaving a gap
++     */
++    public boolean hasIndexedBlocks() {
++        try {
++            return dbManager.executeRead(connection -> {
++                try(PreparedStatement statement = connection.prepareStatement("SELECT COUNT(*) FROM " + INDEXED_BLOCK_TABLE)) {
++                    ResultSet resultSet = statement.executeQuery();
++                    return resultSet.next() && resultSet.getInt(1) > 0;
++                }
++            });
++        } catch(Exception e) {
++            log.error("Error reading the indexed block marker", e);
++            return true;
++        }
++    }
++
++    /**
++     * Moves the first block to index up to startHeight. Only for an index that has not indexed anything yet: on a pruned node the
++     * blocks below its prune height cannot be indexed, so the index starts where the node's blocks do.
++     */
++    public void raiseStartHeight(int startHeight) {
++        lastBlockIndexed.accumulateAndGet(startHeight - 1, Math::max);
++    }
++
++    /**
++     * The first block this index covers, recorded beside the database when the index starts, since nothing in the database itself
++     * says where indexing began (the earliest tweak is only the earliest eligible transaction). The operator needs it: a Silent
++     * Payment received before it is not found.
++     *
++     * @param nextHeight the next block to index, which for an index that has not indexed anything yet is where it starts
++     * @return the first block this index covers, or -1 for an index built before this was recorded
++     */
++    public int recordStartHeight(int nextHeight) {
++        if(dbManager instanceof MemoryDbManager) {
++            return nextHeight;
++        }
++        File file = new File(Storage.getFrigateDbDir(), START_HEIGHT_FILENAME);
++        try {
++            if(!hasIndexedBlocks()) {
++                Files.writeString(file.toPath(), nextHeight + "\n");
++                return nextHeight;
++            }
++            return file.exists() ? Integer.parseInt(Files.readString(file.toPath()).trim()) : -1;
++        } catch(IOException | NumberFormatException e) {
++            log.warn("Could not read or write " + file, e);
++            return -1;
++        }
++    }
++
+     public int getLastBlockIndexed() {
+         try {
+             return dbManager.executeRead(connection -> {
+diff --git a/src/test/java/com/sparrowwallet/frigate/electrum/ElectrumBlockHeaderTest.java b/src/test/java/com/sparrowwallet/frigate/electrum/ElectrumBlockHeaderTest.java
+new file mode 100644
+index 0000000..1aefb1b
+--- /dev/null
++++ b/src/test/java/com/sparrowwallet/frigate/electrum/ElectrumBlockHeaderTest.java
+@@ -0,0 +1,55 @@
++package com.sparrowwallet.frigate.electrum;
++
++import com.sparrowwallet.drongo.protocol.BlockHeader;
++import org.junit.jupiter.api.Test;
++
++import java.util.HexFormat;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++/**
++ * Real mainnet headers either side of the BLAKE2b activation at 961640, read from a knots-blake2b node with
++ * getblockheader &lt;hash&gt; false. The last legacy header is 80 bytes and SHA256d-hashed; the first v2 header is 164 bytes and
++ * BLAKE2b-hashed, and getblockheader's JSON for it reports version 0x20000000 with bit 31 cleared, which is why the length has
++ * to come from the raw header rather than the JSON.
++ */
++public class ElectrumBlockHeaderTest {
++    public static final String HASH_961639 = "00000000000000000001bbc439e13f749dca850d32c7a2834165338713027e65";
++    public static final String HEADER_961639 = "10000a205fca17a6566978303e989d163e1aa9dc6715eef5542e0000000000000000000080fe52c98f1c1f8484213dff5a88315f7c334d0705f7d79579b289781868c0dff5c1916a3d350217510c87ed";
++    public static final String HASH_961640 = "0000000000000050c1e5f69672f459293be14f46e5a494e7a8c8541396f18eeb";
++    public static final String HEADER_961640 = "000000a0657e02138733654183a2c7320d85ca9d743fe139c4bb01000000000000000000c137a8515a0f6b3aaf6049cc7611787c022ad523d51094be0a0363d0dc0bc7684dca936a4f8d001a5671798c84daeb494dca936a00000000b1ccf00d0300000000000000000000001e0300000000000000000000000000000000000068ac0e000000000000000000000000000000000000000000000000000000000000000000";
++
++    @Test
++    public void legacyHeaderIsNotV2() {
++        assertEquals(160, HEADER_961639.length());
++        assertFalse(ElectrumBlockHeader.isV2(HEADER_961639));
++        assertFalse(new ElectrumBlockHeader(961639, HEADER_961639).isV2());
++    }
++
++    @Test
++    public void blake2bHeaderIsV2() {
++        assertEquals(328, HEADER_961640.length());
++        assertTrue(ElectrumBlockHeader.isV2(HEADER_961640));
++        assertTrue(new ElectrumBlockHeader(961640, HEADER_961640).isV2());
++    }
++
++    @Test
++    public void malformedHeadersAreNotV2() {
++        assertFalse(ElectrumBlockHeader.isV2(null));
++        assertFalse(ElectrumBlockHeader.isV2(""));
++        assertFalse(ElectrumBlockHeader.isV2("000000"));
++    }
++
++    /** The tip header Frigate serves is checked against the block hash it was asked for, with drongo's hash of the raw bytes. */
++    @Test
++    public void drongoHashesBothHeadersToTheirBlockHash() {
++        BlockHeader legacy = new BlockHeader(HexFormat.of().parseHex(HEADER_961639));
++        assertFalse(legacy.isV2());
++        assertEquals(HASH_961639, legacy.getHash().toString());
++
++        BlockHeader v2 = new BlockHeader(HexFormat.of().parseHex(HEADER_961640));
++        assertTrue(v2.isV2());
++        assertEquals(HASH_961640, v2.getHash().toString());
++        assertEquals(HASH_961639, v2.getPrevBlockHash().toString());
++    }
++}
